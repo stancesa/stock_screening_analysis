@@ -1,0 +1,66 @@
+name: Weekly Scanner
+
+on:
+  schedule:
+    # 9:00 AM Toronto (America/Toronto) ~= 13:00 UTC during EDT
+    - cron: "0 13 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scanner
+        env:
+          WS_EMAIL_ENABLED: ${{ secrets.WS_EMAIL_ENABLED }}
+          WS_SMTP_SERVER: ${{ secrets.WS_SMTP_SERVER }}
+          WS_SMTP_PORT: ${{ secrets.WS_SMTP_PORT }}
+          WS_SMTP_USER: ${{ secrets.WS_SMTP_USER }}
+          WS_SMTP_PASSWORD: ${{ secrets.WS_SMTP_PASSWORD }}
+          WS_EMAIL_FROM: ${{ secrets.WS_EMAIL_FROM }}
+          WS_EMAIL_TO: ${{ secrets.WS_EMAIL_TO }}
+        run: python main.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-report
+          path: |
+            data/weekly_margin_report.csv
+            data/charts/*.png
+
+      - name: Commit report back to repo
+        run: |
+          mkdir -p reports/$(date -u +'%Y-%m-%d')/charts
+          cp -f data/weekly_margin_report.csv reports/$(date -u +'%Y-%m-%d')/
+          if ls data/charts/*.png 1> /dev/null 2>&1; then
+            cp data/charts/*.png reports/$(date -u +'%Y-%m-%d')/charts/
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "Weekly report $(date -u +'%Y-%m-%d')"
+            git push
+          else
+            echo "No changes to commit."

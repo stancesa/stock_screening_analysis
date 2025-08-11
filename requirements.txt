@@ -1,0 +1,17 @@
+# === Data Analysis & Numerical ===
+pandas            # Data handling and analysis
+numpy             # Numerical computations
+scipy             # Scientific computing and stats
+xlsxwriter        # Excel file writing
+
+# === Market Data ===
+yfinance          # Yahoo Finance API for market data
+
+# === Visualization ===
+matplotlib        # Plotting and chart generation
+
+# === Environment Management ===
+python-dotenv     # Load environment variables from .env
+
+# === Sentiment Analysis ===
+vaderSentiment    # NLP sentiment scoring from text headlines

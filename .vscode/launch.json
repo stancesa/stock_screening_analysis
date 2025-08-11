@@ -1,0 +1,19 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run Main",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Run Backtester",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/backtester/backtester.py",
+      "console": "integratedTerminal"
+    }
+  ]
+}
