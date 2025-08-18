@@ -611,12 +611,13 @@ with c1:
     th["close"]   = st.color_picker("Close",   th["close"])
     th["sma200"]  = st.color_picker("SMA200",  th["sma200"])
     th["overlay"] = st.color_picker("Overlays", th["overlay"])
+    th["risk_band"] = st.color_picker("Risk band fill", th.get("risk_band", "#8dd3c7"))
 with c2:
     th["stop"]     = st.color_picker("Stop",     th["stop"])
     th["target"]   = st.color_picker("Target",   th["target"])
     th["proj_mid"] = st.color_picker("Proj mid", th["proj_mid"])
-th["proj_band"] = st.color_picker("Proj band fill", th["proj_band"])
-th["risk_band"] = st.color_picker("Risk band fill", th.get("risk_band", "#8dd3c7"))
+    th["proj_band"] = st.color_picker("Proj band fill", th["proj_band"])
+
 
 if st.sidebar.button("Save colors"):
     save_theme(th)
