@@ -559,65 +559,46 @@ st.sidebar.divider()
 st.sidebar.subheader("Custom filters")
 
 if "custom_rules" not in st.session_state:
-    st.session_state.custom_rules = []  # [{"col": str, "op": str, "val": str}]
+    st.session_state["custom_rules"] = []   # list of {"col","op","val"}
 
 cols_all = list(df.columns)
-logical = st.sidebar.radio("Combine rules with", ["AND", "OR"], horizontal=True)
+logical = st.sidebar.radio("Combine rules with", ["AND", "OR"], horizontal=True, key="cf_logical")
 
-with st.sidebar.expander("Add rule"):
+with st.sidebar.expander("Add rule", expanded=True):
     col = st.selectbox("Column", cols_all, key="cf_col")
 
-    if col:
-        kind = _infer_col_kind(df[col])
+    # infer & build operator/value controls
+    kind = _infer_col_kind(df[col]) if col else "string"
+    if kind == "bool":
+        op_choices = ["is true", "is false", "==", "!=", "isna", "notna"]
+    elif kind == "numeric":
+        op_choices = ["==", "!=", ">", ">=", "<", "<=", "isna", "notna"]
+    elif kind == "datetime":
+        op_choices = ["==", "!=", ">", ">=", "<", "<=", "isna", "notna"]
+    else:
+        op_choices = ["contains", "not contains", "==", "!=", "isna", "notna"]
 
-        # Operator choices by kind
+    op = st.selectbox("Operator", op_choices, key="cf_op")
+
+    # value widget
+    if op in {"isna", "notna", "is true", "is false"}:
+        val = ""
+    else:
         if kind == "bool":
-            op_choices = ["is true", "is false", "==", "!=", "isna", "notna"]
+            val = st.radio("Value", ["True", "False"], horizontal=True, key="cf_val_bool")
         elif kind == "numeric":
-            op_choices = ["==", "!=", ">", ">=", "<", "<=", "isna", "notna"]
+            val = str(st.number_input("Value", value=0.0, step=1.0, key="cf_val_num"))
         elif kind == "datetime":
-            op_choices = ["==", "!=", ">", ">=", "<", "<=", "isna", "notna"]
-        else:  # string
-            op_choices = ["contains", "not contains", "==", "!=", "isna", "notna"]
-
-        op = st.selectbox("Operator", op_choices, key="cf_op")
-
-        # Value widget based on kind & op
-        if op in {"isna", "notna", "is true", "is false"}:
-            val = ""  # not used
+            val = st.text_input("Value (date/time)", placeholder="e.g. 2024-12-31 15:30", key="cf_val_dt")
         else:
-            if kind == "bool":
-                # Accept a boolean token via radio; will become 'True'/'False' string
-                bool_pick = st.radio("Value", ["True", "False"], horizontal=True, key="cf_val_bool")
-                val = bool_pick
-            elif kind == "numeric":
-                val_num = st.number_input("Value", value=0.0, step=1.0, key="cf_val_num")
-                val = str(val_num)
-            elif kind == "datetime":
-                # Allow natural typing; you can also use st.date_input if you only store dates
-                val_dt = st.text_input("Value (date/time)", placeholder="e.g. 2024-12-31 or 2024-12-31 15:30", key="cf_val_dt")
-                val = val_dt
-            else:
-                val = st.text_input("Value", key="cf_val_txt")
+            val = st.text_input("Value", key="cf_val_txt")
 
-        if st.button("Add rule"):
-            st.session_state.custom_rules.append({"col": col, "op": op, "val": val})
-
-st.sidebar.divider()
-st.sidebar.subheader("Chart colors")
-th = st.session_state.plot_theme
-c1, c2 = st.sidebar.columns(2)
-with c1:
-    th["close"]   = st.color_picker("Close",   th["close"])
-    th["sma200"]  = st.color_picker("SMA200",  th["sma200"])
-    th["overlay"] = st.color_picker("Overlays", th["overlay"])
-    th["risk_band"] = st.color_picker("Risk band fill", th.get("risk_band", "#8dd3c7"))
-with c2:
-    th["stop"]     = st.color_picker("Stop",     th["stop"])
-    th["target"]   = st.color_picker("Target",   th["target"])
-    th["proj_mid"] = st.color_picker("Proj mid", th["proj_mid"])
-    th["proj_band"] = st.color_picker("Proj band fill", th["proj_band"])
-
+    # IMPORTANT: give the button a key and force a rerun after append
+    if st.button("Add rule", key="btn_add_rule"):
+        st.session_state.custom_rules.append({"col": col, "op": op, "val": val})
+        # optional: tiny feedback
+        st.sidebar.success(f"Added: {col} {op} {val}")
+        st.rerun()
 
 if st.sidebar.button("Save colors"):
     save_theme(th)
@@ -652,6 +633,24 @@ if st.session_state.custom_rules:
         mask &= comb
 
 df_view = df[mask].copy()
+
+st.sidebar.divider()
+st.sidebar.subheader("Chart colors")
+th = st.session_state.plot_theme
+c1, c2 = st.sidebar.columns(2)
+with c1:
+    th["close"]   = st.color_picker("Close",   th["close"])
+    th["sma200"]  = st.color_picker("SMA200",  th["sma200"])
+    th["overlay"] = st.color_picker("Overlays", th["overlay"])
+    th["risk_band"] = st.color_picker("Risk band fill", th.get("risk_band", "#8dd3c7"))
+with c2:
+    th["stop"]     = st.color_picker("Stop",     th["stop"])
+    th["target"]   = st.color_picker("Target",   th["target"])
+    th["proj_mid"] = st.color_picker("Proj mid", th["proj_mid"])
+    th["proj_band"] = st.color_picker("Proj band fill", th["proj_band"])
+
+
+
 
 # =========================
 # Sort & table
