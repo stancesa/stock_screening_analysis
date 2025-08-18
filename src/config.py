@@ -26,7 +26,7 @@ class ScannerConfig:
     trailing_pct: float = 0.07
     max_hold_days: int = 60
     holdings_boost_score: int = 1
-    top_k_charts: int = 6
+    top_k_charts: int = 212
     email_enabled: bool = False
     smtp_server: str = ""
     smtp_port: int = 587

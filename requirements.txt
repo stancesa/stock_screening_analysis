@@ -9,6 +9,8 @@ yfinance          # Yahoo Finance API for market data
 
 # === Visualization ===
 matplotlib        # Plotting and chart generation
+plotly            # Interactive graphing library
+streamlit         # Web app framework
 
 # === Environment Management ===
 python-dotenv     # Load environment variables from .env
