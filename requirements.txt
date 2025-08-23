@@ -3,6 +3,7 @@ pandas            # Data handling and analysis
 numpy             # Numerical computations
 scipy             # Scientific computing and stats
 xlsxwriter        # Excel file writing
+dataclasses       # Data classes for structured data
 
 # === Market Data ===
 yfinance          # Yahoo Finance API for market data

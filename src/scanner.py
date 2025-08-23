@@ -11,6 +11,8 @@ from logging import LoggerAdapter
 
 from collections import OrderedDict
 
+from dataclasses import dataclass
+
 from .config import ScannerConfig
 from .utils import read_list, fetch_history, market_risk_ok
 from .indicators import (
@@ -340,6 +342,9 @@ def build_structured_record(
         }),
         "series": OrderedDict({
             "close_series": _to_1d_list(tech.get("close_series", [])),
+            "open_series":  _to_1d_list(tech.get("open_series", [])),
+            "high_series":  _to_1d_list(tech.get("high_series", [])),
+            "low_series":   _to_1d_list(tech.get("low_series", [])),
             "sma200_series": _to_1d_list(tech.get("sma200_series", [])),
             "dates_series": tech.get("dates_series", []),
         }),
@@ -571,10 +576,13 @@ def technicals(df: pd.DataFrame, cfg: ScannerConfig) -> Dict[str, Any]:
             "close_series": _to_1d_list(close.tail(260)),
             "sma200_series": _to_1d_list(sma200_series.tail(260)),
             "dates_series": [d.strftime("%Y-%m-%d") for d in df.tail(260).index],
+            "open_series": _to_1d_list(df["Open"].tail(260)),
+            "high_series": _to_1d_list(df["High"].tail(260)),
+            "low_series": _to_1d_list(df["Low"].tail(260)),
         }
 
         # Final sanity logs to catch ndarray/DF leaks before returning
-        for nm in ["close_series", "sma200_series", "dates_series"]:
+        for nm in ["close_series", "open_series", "high_series", "low_series", "sma200_series", "dates_series"]:
             log_value(log, nm, result[nm])
 
         log.info("Technicals computed OK")
