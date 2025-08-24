@@ -53,6 +53,14 @@ DEFAULT_THEME = {
     "table_neg": "#fee2e2",
 }
 
+RECO_COLORS = {
+    "Strong Buy": "#008000",
+    "Buy": "#90EE90",
+    "Hold": "#FFFF00",
+    "Sell": "#FFA500",
+    "Strong Sell": "#FF0000",
+}
+
 def load_theme() -> dict:
     if THEME_FILE.exists():
         try:

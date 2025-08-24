@@ -5,15 +5,19 @@ import json
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+import re
+import html as _html
 from copy import deepcopy
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 from core.paths import PROJECT_ROOT, DEFAULT_OUTPUT
-from core.io import DEFAULT_THEME,load_theme, save_theme, _run_main_and_reload, _read_path_cached, save_profile, load_profile, list_profiles
+from core.io import DEFAULT_THEME,RECO_COLORS, load_theme, save_theme, _run_main_and_reload, _read_path_cached, save_profile, load_profile, list_profiles
 from core.utils import _resolve, _get_series_lists, _coerce_numeric, _coerce_boolish, _parse_ci_label
 from core.filters import OPS, TRUE_TOKENS, FALSE_TOKENS, _infer_col_kind, _coerce_series_for_rule, _parse_datetime_value
 from core.helptext import h
@@ -135,33 +139,116 @@ def ui_run_scan_and_choose_source(default_path: str) -> tuple[Optional[io.BytesI
     return uploaded, path_text, prefer_output
 
 def _inject_chip_css():
-    if st.session_state.get("_chip_css_injected_v2"):
+    if st.session_state.get("_chip_css_injected_v8"):  # bump the flag
         return
-    st.session_state["_chip_css_injected_v2"] = True
-    st.markdown(
-        """
-        <style>
-        .kpi-row { display:flex; flex-wrap:wrap; gap:10px; align-items:flex-start; margin:6px 0; }
-        .kpi-chip {
-          display:inline-flex; align-items:center; gap:10px;
-          padding:8px 12px; border-radius:999px; font-weight:600; font-size:13px; line-height:1;
-          backdrop-filter: blur(6px);
-          border:1px solid rgba(255,255,255,.14);
-          box-shadow: inset 0 1px 0 rgba(255,255,255,.18), 0 2px 6px rgba(0,0,0,.25);
-          color: var(--chip-fg, #0f172a);
-        }
-        .kpi-chip .val {
-          font-variant-numeric: tabular-nums;
-          padding:3px 8px; border-radius:999px;
-          background: var(--chip-badge-bg, rgba(255,255,255,.25));
-          border:1px solid rgba(255,255,255,.22);
-          color: inherit;
-        }
-        .kpi-chip:hover { transform: translateY(-1px); transition: transform .15s ease; }
-        </style>
-        """,
-        unsafe_allow_html=True,
+    st.session_state["_chip_css_injected_v8"] = True
+
+    st.markdown("""
+    <style>
+      /* Recommendation badge */
+      .reco-badge {
+        display:inline-block; padding:6px 10px; border-radius:999px;
+        font-weight:700; font-size:12px; line-height:1;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,.18), 0 2px 6px rgba(0,0,0,.25);
+        border:1px solid rgba(0,0,0,.12);
+        color:#fff;
+      }
+      .reco-strongbuy  { background:#008000; }  /* Solid Green   */
+      .reco-buy        { background:#90EE90; }  /* Light Green   */
+      .reco-hold       { background:#FFFF00; }  /* Yellow        */
+      .reco-sell       { background:#FFA500; }  /* Orange        */
+      .reco-strongsell { background:#FF0000; }  /* Vivid Red     */
+      
+      .kpi-row { display:flex; flex-wrap:wrap; gap:10px; align-items:flex-start; margin:6px 0; }
+      .kpi-chip {
+        position: relative;
+        display:inline-flex; align-items:center; gap:10px;
+        padding:8px 12px; border-radius:999px; font-weight:600; font-size:13px; line-height:1;
+        backdrop-filter: blur(6px);
+        border:1px solid rgba(255,255,255,.14);
+        box-shadow: inset 0 1px 0 rgba(255,255,255,.18), 0 2px 6px rgba(0,0,0,.25);
+        color: var(--chip-fg, #0f172a);
+      }
+      .kpi-chip .val {
+        font-variant-numeric: tabular-nums;
+        padding:3px 8px; border-radius:999px;
+        background: var(--chip-badge-bg, rgba(255,255,255,.25));
+        border:1px solid rgba(255,255,255,.22);
+        color: inherit;
+      }
+      .kpi-chip:hover { transform: translateY(-1px); transition: transform .15s ease; }
+
+      /* Tooltip container (inside the chip) */
+      .kpi-tip {
+        position:absolute;
+        top:50%; left:100%;
+        transform: translate(10px, -50%);
+        display:none;
+        padding:12px 14px; border-radius:12px;
+        max-width:none; white-space:nowrap; word-break:normal; overflow-wrap:normal;
+        box-shadow:0 14px 40px rgba(0,0,0,.28), inset 0 1px 0 rgba(255,255,255,.08);
+        z-index:2147483000;  /* above plotly etc */
+      }
+      .kpi-row, .kpi-chip { overflow: visible; }     
+      .kpi-chip { position: relative; }
+      .kpi-chip:hover > .kpi-tip { display:block; }               
+      .kpi-chip:hover {                                     
+        transform: translateY(-1px);
+        transition: transform .15s ease;
+        z-index: 2147483647;
+      }
+    .kpi-tip { z-index: 2147483000; }               
+
+      /* Optional inner typography */
+      .kpi-tip h5 { margin:0 0 6px 0; font-size:13px; }
+      .kpi-tip .section { margin-top:8px; font-size:12px; line-height:1.35; }
+      .kpi-tip ul { margin:4px 0 0 18px; padding:0; }
+      .kpi-tip li { margin:2px 0; }
+      .kpi-tip table { width:100%; border-collapse:collapse; font-size:12px; }
+      .kpi-tip th, .kpi-tip td { padding:2px 0; }
+      .kpi-tip thead th { text-align:left; }
+      .kpi-tip td[style*="text-align:right"] { text-align:right; }
+    </style>
+    """, unsafe_allow_html=True)
+
+def _reco_tip_html(buy_score: float, sell_score: float, params, reco_label: str) -> str:
+    """Single-line tooltip: higher score first, e.g., 'Sell > Buy' with colored dots."""
+    buy = ("Buy",  float(buy_score),  float(params.composite_threshold), RECO_COLORS.get("Buy",  "#90EE90"))
+    sell= ("Sell", float(sell_score), float(params.sell_threshold),      RECO_COLORS.get("Sell", "#FFA500"))
+
+    left, right = (sell, buy) if sell[1] > buy[1] else (buy, sell)
+    sep = "=" if abs(left[1] - right[1]) < 1e-9 else ">"
+    
+    def pill(name, score, thr, color):
+        return (
+            "<span style='display:inline-flex;align-items:center;gap:6px;"
+            "padding:4px 8px;border-radius:999px;border:1px solid rgba(0,0,0,.12);"
+            "box-shadow:inset 0 1px 0 rgba(255,255,255,.18);white-space:nowrap;'>"
+            f"<span style='width:8px;height:8px;border-radius:999px;background:{color};display:inline-block'></span>"
+            f"<b>{name}</b>&nbsp;{score:.2f}"
+            f"&nbsp;<span style='opacity:.8'>(vs the {thr:.2f})</span>"
+            "</span>"
+        )
+
+    return (
+        "<div class='section'>"
+        "<h5>Recommendation</h5>"
+        f"<div style='margin:0 0 6px 0'><b>{_html.escape(reco_label)}</b></div>"
+        "<div style='display:flex;align-items:center;gap:8px;font-size:12px;'>"
+        f"{pill(*left)}"
+        f"<span style='opacity:.7;font-weight:700'>{sep}</span>"
+        f"{pill(*right)}"
+        "</div>"
+        "</div>"
     )
+
+def _quick_reco_from_norm(comp: float, sig: float) -> str:
+    if not (np.isfinite(comp) and np.isfinite(sig)): return "⚪ Hold"
+    if comp >= 0.80 and sig >= 0.70: return "🟢 Strong Buy"
+    if comp >= 0.60 and sig >= 0.50: return "🟩 Buy"
+    if comp <= 0.20 and sig <= 0.40: return "🔴 Strong Sell"
+    if comp <= 0.40 and sig <= 0.50: return "🟧 Sell"
+    return "⚪ Hold"
 
 def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
     h = hex_color.strip().lstrip("#")
@@ -199,6 +286,282 @@ def _chip_style_from_base(base_hex: str, force_white_text: bool) -> str:
         f"--chip-badge-bg:{badge};"
         f"--chip-fg:{fg};"
     )
+
+def _pretty_signal_name(k: str) -> str:
+    if not isinstance(k, str):
+        return str(k)
+    return re.sub(r"\s+", " ", k.replace("_", " ").strip()).capitalize()
+
+def _escape_attr(s: str) -> str:
+    # Escape &, <, >, and " so HTML can safely live in an attribute.
+    return _html.escape(s, quote=True)
+
+def _extract_signal_names_from_row(row: pd.Series) -> list[str]:
+    """Prefer precomputed signal lists from the row if available."""
+    candidates = [
+        "signals_list", "signals", "signals_fired", "signal_names",
+        "signals_and_scores__signals", "signals_and_scores__signals_list",
+        "signals_and_scores__signals_fired",
+    ]
+    for c in candidates:
+        if c in row.index and pd.notna(row[c]):
+            raw = row[c]
+            if isinstance(raw, (list, tuple, np.ndarray)):
+                return [str(v) for v in raw if str(v).strip()]
+            if isinstance(raw, str) and raw.strip():
+                s = raw.strip()
+                try:
+                    obj = json.loads(s)
+                    if isinstance(obj, list):
+                        return [str(v) for v in obj if str(v).strip()]
+                    if isinstance(obj, dict):
+                        return [_pretty_signal_name(k) for k, v in obj.items() if bool(v)]
+                except Exception:
+                    pass
+                parts = [p.strip() for p in re.split(r"[;,\|]", s) if p.strip()]
+                if parts:
+                    return parts
+    return []
+
+def classify_reco_label(buy_score: float, sell_score: float, params) -> str:
+    mb = float(buy_score)  - float(params.composite_threshold)
+    ms = float(sell_score) - float(params.sell_threshold)
+    # Strong calls when one side clearly clears its threshold and the other is comfortably below
+    if mb >= 0.12 and ms < -0.05: return "Strong Buy"
+    if ms >= 0.12 and mb < -0.05: return "Strong Sell"
+    if mb >= 0.00 and ms < 0.00:  return "Buy"
+    if ms >= 0.00:                return "Sell"
+    return "Hold"
+
+def _normalize_to_unit(s: pd.Series, method: str = "percentile", robust_q=(0.05, 0.95)) -> pd.Series:
+    """
+    Return a 0–1 series using one of:
+      - "percentile": percentile rank in [0,1]
+      - "winsor_minmax": min–max between robust quantiles (clipped to [0,1])
+      - "minmax": full-range min–max (may be sensitive to outliers)
+    """
+    x = pd.to_numeric(s, errors="coerce")
+
+    if method == "percentile":
+        return x.rank(pct=True, na_option="keep")
+
+    if method == "winsor_minmax":
+        lo, hi = np.nanquantile(x, robust_q[0]), np.nanquantile(x, robust_q[1])
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            return pd.Series(np.nan, index=x.index, dtype="float64")
+        out = (x - lo) / (hi - lo)
+        return out.clip(0.0, 1.0)
+
+    if method == "minmax":
+        mn, mx = np.nanmin(x.values), np.nanmax(x.values)
+        if not np.isfinite(mn) or not np.isfinite(mx) or mx <= mn:
+            return pd.Series(np.nan, index=x.index, dtype="float64")
+        return (x - mn) / (mx - mn)
+
+    # fallback: percentile
+    return x.rank(pct=True, na_option="keep")
+
+def _balanced_fallback_params() -> BuyParams:
+    return BuyParams(
+        composite_threshold=0.60,
+        w_rsi=0.20, w_trend=0.20, w_breakout=0.00, w_value=0.10, w_flow=0.05,
+        rsi_buy_max=45.0, rsi_floor=20.0, sma200_window=200,
+        donch_lookback=20, gap_min_pct=0.5, value_center_dev_pct=-5.0, vol_ratio_min=1.50,
+        use_engine_stop=False, atr_mult=1.5, stop_pct=10.0, reward_R=2.0,
+        portfolio_value=20000.0, risk_per_trade_pct=0.5, min_price=1.0, min_adv_dollars=250000.0,
+        w_bbands=0.20, w_donchian=0.25, bb_window=20, bb_k=2.0,
+        w_bbands_sell=0.25, w_donchian_sell=0.25,
+        sell_threshold=0.60, w_rsi_sell=0.30, w_trend_down=0.30, w_breakdown=0.25, w_exhaustion=0.10, w_flow_out=0.05,
+        rsi_overbought_min=70.0, ema_fast_span=21, sma_mid_window=50, donch_lookback_sell=20, gap_down_min_pct=0.5,
+    )
+
+def _signals_panel_md(row, x, y_close, y_sma, y_open, y_high, y_low) -> str:
+    """Markdown for Signals breakdown."""
+    # prefer row-provided signals if present
+    names = _extract_signal_names_from_row(row)
+    if names:
+        names = sorted(set(_pretty_signal_name(s) for s in names))
+        return "#### Signals (from table row)\n" + "\n".join(f"- {n}" for n in names)
+
+    params, buy_res, sell_res = _compute_buy_sell(row, x, y_close, y_sma, y_open, y_high, y_low)
+    buy_features  = [ _pretty_signal_name(k) for k, v in (buy_res.get("features") or {}).items() if bool(v) ]
+    sell_features = [ _pretty_signal_name(k) for k, v in (sell_res.get("features") or {}).items() if bool(v) ]
+    guards_bad    = buy_res.get("guard_reasons") or []
+    sell_triggers = sell_res.get("reasons") or []
+
+    md = []
+    md.append(f"#### Signals")
+    md.append(f"- **Buy score:** {buy_res.get('score', float('nan')):.2f}")
+    md.append(f"- **Sell score:** {sell_res.get('score', float('nan')):.2f}")
+    md.append("\n**BUY features**")
+    md += [f"- {s}" for s in sorted(set(buy_features))] or ["- —"]
+    md.append("\n**SELL features**")
+    md += [f"- {s}" for s in sorted(set(sell_features))] or ["- —"]
+    if guards_bad:
+        md.append("\n**Guardrails triggered**")
+        md += [f"- {g}" for g in guards_bad]
+    if sell_triggers:
+        md.append("\n**SELL triggers**")
+        md += [f"- {g}" for g in sell_triggers]
+    return "\n".join(md)
+
+def _composite_breakdown_panel_md(row, x, y_close, y_sma, y_open, y_high, y_low) -> str:
+    """
+    Markdown for Composite breakdown.
+    If your DF already has a composite decomposition column (e.g., JSON), you can parse it here.
+    Otherwise we show the BUY composite-style breakdown from the current engine (components × weights).
+    """
+    params, buy_res, _ = _compute_buy_sell(row, x, y_close, y_sma, y_open, y_high, y_low)
+    comps = buy_res.get("components") or {}
+    # Map component -> weight attribute on params
+    weight_map = {
+        "rsi": "w_rsi",
+        "trend": "w_trend",
+        "value": "w_value",
+        "flow": "w_flow",
+        "bbands": "w_bbands",
+        "donchian": "w_donchian",
+        "breakout": "w_breakout",
+        # add more if your engine exposes them
+    }
+    rows = []
+    total = 0.0
+    for k, v in comps.items():
+        w_attr = weight_map.get(k)
+        w = float(getattr(params, w_attr, 0.0)) if w_attr else 0.0
+        contrib = float(v) * w
+        total += contrib
+        rows.append((k, float(v), w, contrib))
+    rows.sort(key=lambda t: -abs(t[3]))
+
+    md = []
+    md.append("#### Composite score breakdown")
+    md.append(f"- **Composite (engine)**: `{total:.2f}`  &nbsp;&nbsp; _(threshold: {params.composite_threshold:.2f})_")
+    md.append("")
+    md.append("| Component | Value (0–1) | Weight | Contribution |")
+    md.append("|---|---:|---:|---:|")
+    for k, val, w, c in rows:
+        md.append(f"| {k} | {val:.2f} | {w:.2f} | {c:.2f} |")
+    md.append(f"| **Total** |  |  | **{total:.2f}** |")
+    md.append("\n<sub>Composite ≈ Σ(valueᵢ × weightᵢ). Guardrails/eligibility checks may cap or gate buys.</sub>")
+    return "\n".join(md)
+
+def _compute_buy_sell(row, x, y_close, y_sma, y_open, y_high, y_low):
+    """Compute engines with last-used params or a balanced fallback."""
+    params = st.session_state.get("last_used_params", _balanced_fallback_params())
+    buy_res  = compute_buy_signal(row=row, dates=x, close=y_close, sma200=y_sma, open_=y_open, high=y_high, low=y_low, params=params)
+    sell_res = compute_sell_signal(row=row, dates=x, close=y_close, sma200=y_sma, open_=y_open, high=y_high, low=y_low, params=params)
+    return params, buy_res, sell_res
+
+def _as_unit_score(v):
+    try:
+        v = float(v)
+    except Exception:
+        return np.nan
+    if not np.isfinite(v):
+        return np.nan
+    # Heuristics: if it looks like a percent, normalize
+    if 1.0 < v <= 100.0:
+        return v / 100.0
+    return v
+
+def _normalize_score_series(s: pd.Series) -> pd.Series:
+    s = pd.to_numeric(s, errors="coerce")
+    med = float(np.nanmedian(s)) if s.notna().any() else np.nan
+    if np.isfinite(med) and 1.0 < med <= 100.0:
+        return s / 100.0
+    return s
+
+def _compute_signals_for_display(row, x, y_close, y_sma, y_open, y_high, y_low) -> dict:
+    params = st.session_state.get("last_used_params", _balanced_fallback_params())
+    buy_res  = compute_buy_signal(row=row, dates=x, close=y_close, sma200=y_sma, open_=y_open, high=y_high, low=y_low, params=params)
+    sell_res = compute_sell_signal(row=row, dates=x, close=y_close, sma200=y_sma, open_=y_open, high=y_high, low=y_low, params=params)
+    buy_features  = [ _pretty_signal_name(k) for k, v in (buy_res.get("features") or {}).items() if bool(v) ]
+    sell_features = [ _pretty_signal_name(k) for k, v in (sell_res.get("features") or {}).items() if bool(v) ]
+    return {
+        "buy_features": sorted(set(buy_features)),
+        "sell_features": sorted(set(sell_features)),
+        "guards_bad": buy_res.get("guard_reasons") or [],
+        "sell_triggers": sell_res.get("reasons") or [],
+        "buy_score": float(buy_res.get("score", float("nan"))),
+        "sell_score": float(sell_res.get("score", float("nan"))),
+    }
+
+def _build_signals_hover_html(row, x, y_close, y_sma, y_open, y_high, y_low) -> str:
+    names = _extract_signal_names_from_row(row)
+    if names:
+        items = "".join(f"<li>{_pretty_signal_name(s)}</li>" for s in sorted(set(names)))
+        return f'<div class="section"><h5>Signals (from table row)</h5><ul>{items or "<li>—</li>"}</ul></div>'
+
+    params, buy_res, sell_res = _compute_buy_sell(row, x, y_close, y_sma, y_open, y_high, y_low)
+    buy_features  = [ _pretty_signal_name(k) for k, v in (buy_res.get("features") or {}).items() if bool(v) ]
+    sell_features = [ _pretty_signal_name(k) for k, v in (sell_res.get("features") or {}).items() if bool(v) ]
+    guards_bad    = buy_res.get("guard_reasons") or []
+    sell_triggers = sell_res.get("reasons") or []
+
+    def _ul(lst): return "<ul>" + ("".join(f"<li>{_html.escape(s)}</li>" for s in lst) if lst else "<li>—</li>") + "</ul>"
+    return (
+        f'<div class="section"><h5>BUY features <span style="opacity:.7">(score: {buy_res.get("score", float("nan")):.2f})</span></h5>{_ul(sorted(set(buy_features)))}</div>'
+        f'<div class="section"><h5>SELL features <span style="opacity:.7">(score: {sell_res.get("score", float("nan")):.2f})</span></h5>{_ul(sorted(set(sell_features)))}</div>'
+        + (f'<div class="section"><h5>Guardrails</h5>{_ul(guards_bad)}</div>' if guards_bad else "")
+        + (f'<div class="section"><h5>SELL triggers</h5>{_ul(sell_triggers)}</div>' if sell_triggers else "")
+    )
+
+def _build_composite_hover_html(row, x, y_close, y_sma, y_open, y_high, y_low) -> str:
+    params, buy_res, _ = _compute_buy_sell(row, x, y_close, y_sma, y_open, y_high, y_low)
+    comps = buy_res.get("components") or {}
+
+    # Read the normalized column name from session (set once after df_view is built)
+    comp_norm_col = st.session_state.get("_comp_norm_col")
+    comp_norm_val = None
+    if comp_norm_col and comp_norm_col in row.index and pd.notna(row[comp_norm_col]):
+        comp_norm_val = float(row[comp_norm_col])
+
+    # ⬇️ Your snippet goes right here
+    header_line = ""
+    if comp_norm_val is not None and np.isfinite(comp_norm_val):
+        header_line = (
+            f"<div style='font-size:12px;margin:2px 0 8px 0;'>"
+            f"Dataset-normalized composite: <b>{comp_norm_val:.2f}</b> "
+            f"(≈P{int(round(comp_norm_val*100)):d})</div>"
+        )
+
+    weight_map = {
+        "rsi": "w_rsi", "trend": "w_trend", "value": "w_value", "flow": "w_flow",
+        "bbands": "w_bbands", "donchian": "w_donchian", "breakout": "w_breakout",
+    }
+
+    rows, total = [], 0.0
+    for k, v in comps.items():
+        w = float(getattr(params, weight_map.get(k, ""), 0.0))
+        val = float(v)
+        contrib = val * w
+        total += contrib
+        rows.append((k, val, w, contrib))
+    rows.sort(key=lambda t: -abs(t[3]))
+
+    trs = "".join(
+        f"<tr><td>{_html.escape(k)}</td>"
+        f"<td style='text-align:right'>{val:.2f}</td>"
+        f"<td style='text-align:right'>{w:.2f}</td>"
+        f"<td style='text-align:right'>{contrib:.2f}</td></tr>"
+        for k, val, w, contrib in rows
+    )
+
+    return f"""
+      <div class="section">
+        <h5>Composite breakdown</h5>
+        {header_line}
+        <div style="font-size:12px;opacity:.8;margin-bottom:6px;">
+          Composite ≈ Σ(valueᵢ × weightᵢ) &nbsp; | &nbsp; threshold: {params.composite_threshold:.2f}
+        </div>
+        <table style="width:100%; border-collapse:collapse;">
+          <thead><tr><th style="text-align:left">Component</th><th style="text-align:right">Value</th><th style="text-align:right">Weight</th><th style="text-align:right">Contrib</th></tr></thead>
+          <tbody>{trs}</tbody>
+          <tfoot><tr><td colspan="3" style="text-align:right;font-weight:600">Total</td><td style="text-align:right;font-weight:600">{total:.2f}</td></tr></tfoot>
+        </table>
+      </div>
+    """
 
 def kpi_chip(
     label: str,
@@ -246,68 +609,144 @@ def kpi_chip(
     )
 
 def kpi_row(
-    chips: list[tuple[str, str | float | int, str, str | None]],
+    chips: list[tuple],  # (label, value, color, icon[, hover_html_or_dict])
     *,
     scale: float = 1.2,
     force_white_on_dark: bool = True,
 ):
-    """
-    Render a responsive row of chips.
-    chips = [(label, value, base_color_hex, icon_or_None), ...]
-    """
     _inject_chip_css()
-    dark = _is_dark_theme() if force_white_on_dark else False
 
+    # Theme-aware tooltip colors
+    dark = _is_dark_theme() if force_white_on_dark else False
+    tip_bg     = "rgba(17,24,39,.98)" if dark else "rgba(255,255,255,.98)"
+    tip_fg     = "#e5e7eb"            if dark else "#0f172a"
+    tip_border = "rgba(255,255,255,.14)" if dark else "rgba(0,0,0,.08)"
+
+    # scale paddings / font sizes
     pad_y = max(6, int(8 * scale))
     pad_x = max(10, int(12 * scale))
-    gap = max(8, int(10 * scale))
-    fs = max(12, int(13 * scale))
+    gap   = max(8, int(10 * scale))
+    fs    = max(12, int(13 * scale))
     val_pad_y = max(2, int(3 * scale))
     val_pad_x = max(6, int(8 * scale))
-    val_fs = max(11, int(12 * scale))
+    val_fs    = max(11, int(12 * scale))
 
-    html = ['<div class="kpi-row">']
-    for label, value, color, icon in chips:
+    html_parts = ['<div class="kpi-row">']
+
+    for item in chips:
+        label, value, color, icon = item[:4]
+        hover = item[4] if len(item) >= 5 else None
+
+        hover_html = None
+        max_w = 520
+        if isinstance(hover, dict):
+            hover_html = hover.get("html")
+            max_w = int(hover.get("max_width", max_w))
+        elif isinstance(hover, str):
+            hover_html = hover
+
         r, g, b = _hex_to_rgb(color or "#22c55e")
         top = f"rgba({r},{g},{b}, .30)"; bot = f"rgba({r},{g},{b}, .14)"; badge = f"rgba({r},{g},{b}, .18)"
-        if dark:
-            fg = "#ffffff"
-        else:
-            lum = (0.299*r + 0.587*g + 0.114*b)/255
-            fg = "#0f172a" if lum > 0.7 else "white"
-        style = (
+        lum = (0.299*r + 0.587*g + 0.114*b)/255
+        fg = "#ffffff" if dark else ("#0f172a" if lum > 0.7 else "white")
+
+        chip_style = (
             f"background: linear-gradient(180deg, {top}, {bot});"
-            f"border-color: rgba({r},{g},{b}, .45);"
-            f"--chip-badge-bg:{badge};"
-            f"--chip-fg:{fg};"
-            f"padding:{pad_y}px {pad_x}px; gap:{gap}px; font-size:{fs}px;"
+            f"border:1px solid rgba({r},{g},{b}, .45);"
+            f"box-shadow: inset 0 1px 0 rgba(255,255,255,.18), 0 2px 6px rgba(0,0,0,.25);"
+            f"color:{fg}; border-radius:999px; display:inline-flex; align-items:center; gap:{gap}px;"
+            f"padding:{pad_y}px {pad_x}px; font-size:{fs}px; line-height:1;"
+            f"--chip-badge-bg:{badge}; --chip-fg:{fg};"
         )
         icon_html = f"<span style='font-size:{fs}px; line-height:1'>{icon}</span>" if icon else ""
-        html.append(
-            f'<div class="kpi-chip" style="{style}">{icon_html}'
-            f'<span>{label}</span>'
-            f'<span class="val" style="padding:{val_pad_y}px {val_pad_x}px; font-size:{val_fs}px;">{value}</span>'
-            f'</div>'
+
+        # Inline tooltip (if provided)
+        tip_html = ""
+        if hover_html:
+            tip_html = (
+                f"<div class='kpi-tip' "
+                f"style='background:{tip_bg};color:{tip_fg};border:1px solid {tip_border};"
+                f"max-width:{max_w}px;'>"
+                f"{hover_html}"
+                f"</div>"
+            )
+
+        html_parts.append(
+            f"<div class='kpi-chip{' has-tip' if hover_html else ''}' style='{chip_style}'>"
+            f"{icon_html}<span>{label}</span>"
+            f"<span class='val' style='padding:{val_pad_y}px {val_pad_x}px; font-size:{val_fs}px;'>"
+            f"{value}</span>"
+            f"{tip_html}"
+            f"</div>"
         )
-    html.append("</div>")
-    st.markdown("\n".join(html), unsafe_allow_html=True)
 
-def render_kpis(row: pd.Series, cols: dict):
-    fmt = lambda v, d=2: "—" if (v is None or pd.isna(v)) else f"{float(v):,.{d}f}"
-    comp = row.get(cols["comp"]); sig = row.get(cols["sig"]); rsi = row.get(cols["rsi"])
-    last = row.get(cols["last"]); owned = row.get(cols["owned"], False)
+    html_parts.append("</div>")
+    st.markdown("\n".join(html_parts), unsafe_allow_html=True)
 
-    # simple color heuristics
-    bg_comp = th["kpi_good"] if (pd.notna(comp) and float(comp) >= 0.60) else th["kpi_bad"]
-    bg_rsi  = th["kpi_good"] if (pd.notna(rsi) and float(rsi) <= 45) else th["kpi_bad"]
+def render_kpis(
+    row: pd.Series,
+    cols: dict,
+    x, y_close, y_sma, y_open, y_high, y_low,
+    df_all: Optional[pd.DataFrame] = None,
+):
+    comp_col = cols.get("comp_norm") or cols["comp"]
+    sig_col  = cols.get("sig_norm")  or cols["sig"]
 
-    kpi_row([
-        ("Composite", f"{row.get(cols['comp'], float('nan')):,.2f}", "#22c55e", "✅"),
-        ("Signals",   f"{row.get(cols['sig'], 0):,.0f}",            "#3b82f6", "📊"),
+    # --- compute dataset-normalized composite (0..1) and percentile ---
+    comp_norm_val, comp_pct = None, None
+    comp_raw = float(row.get(cols['comp'], np.nan)) if cols.get('comp') else np.nan
+    if (
+        df_all is not None and cols.get('comp') and cols['comp'] in df_all.columns
+        and np.isfinite(comp_raw)
+    ):
+        s_all = pd.to_numeric(df_all[cols['comp']], errors="coerce").dropna()
+        if len(s_all) >= 2:
+            lo, hi = float(s_all.min()), float(s_all.max())
+            rng = hi - lo
+            if rng > 1e-12:
+                comp_norm_val = float(np.clip((comp_raw - lo) / rng, 0.0, 1.0))
+            # Percentile rank (robust/intuitive)
+            comp_pct = float((s_all <= comp_raw).mean())
+
+    # --- tooltips ---
+    comp_hover_core = _build_composite_hover_html(row, x, y_close, y_sma, y_open, y_high, y_low)
+    header_line = ""
+    if comp_norm_val is not None and np.isfinite(comp_norm_val):
+        p_txt = f"P{int(round((comp_pct if comp_pct is not None else comp_norm_val)*100)):d}"
+        header_line = (
+            f"<div style='font-size:12px;opacity:.8;margin-bottom:6px;'>"
+            f"Dataset-normalized composite: <b>{comp_norm_val:.2f}</b> (≈{p_txt})</div>"
+        )
+    comp_hover = header_line + comp_hover_core
+    sigs_hover = _build_signals_hover_html(row, x, y_close, y_sma, y_open, y_high, y_low)
+
+    # --- badges (prefer normalized for Composite; for Signals respect sig_col) ---
+    comp_badge = comp_norm_val if comp_norm_val is not None else comp_raw
+    sig_badge  = float(row.get(sig_col, 0.0))
+
+    # Get scores for current row
+    sig_info = _compute_signals_for_display(row, x, y_close, y_sma, y_open, y_high, y_low)
+    params = st.session_state.get("last_used_params", _balanced_fallback_params())
+    reco_label = classify_reco_label(sig_info["buy_score"], sig_info["sell_score"], params)
+    reco_color = RECO_COLORS[reco_label]
+    reco_tip = _reco_tip_html(
+        sig_info["buy_score"],
+        sig_info["sell_score"],
+        params,
+        reco_label,
+    )
+
+    # Prepend a 'Recommendation' chip
+    chips = [
+        ("Recommendation", reco_label, reco_color, "🏷️", {"html": reco_tip, "max_width": 420}),
+        ("Composite", f"{comp_badge:,.2f}", "#22c55e", "✅", {"html": comp_hover, "max_width": 520}),
+        ("Signals",   f"{sig_badge:,.2f}", "#3b82f6", "📊", {"html": sigs_hover, "max_width": 520}),
         ("RSI",       f"{row.get(cols['rsi'], float('nan')):,.2f}", "#ef4444", "🧭"),
         ("Last",      f"{row.get(cols['last'], float('nan')):,.2f}", "#a78bfa", "💵"),
         ("Owned",     "Yes" if bool(row.get(cols['owned'], False)) else "No", "#f59e0b", "📦"),
-    ], scale=1.35)
+    ]
+    kpi_row(chips, scale=1.35)
+
 
 def _read_any_table(uploaded_file: Optional[io.BytesIO], path_text: str, prefer_output: bool) -> tuple[pd.DataFrame, str, Optional[Tuple[List[str], str]]]:
     """
@@ -370,14 +809,28 @@ def resolve_columns(df: pd.DataFrame) -> dict:
         open_series=_resolve(cols, ("open_series", "series__open_series")),
         high_series=_resolve(cols, ("high_series", "series__high_series")),
         low_series=_resolve(cols, ("low_series", "series__low_series")),
+        signals_list=_resolve(cols, (
+            "signals_list", "signals", "signals_fired", "signal_names",
+            "signals_and_scores__signals", "signals_and_scores__signals_list",
+            "signals_and_scores__signals_fired",
+        )),
     )
 
 
 def render_sidebar_filters(df: pd.DataFrame, cols: dict) -> tuple[pd.DataFrame, str]:
     """Render all sidebar filtering, custom rules, sort, and return filtered+sorted view and sort column."""
     st.sidebar.header("Filters")
-    min_sig  = st.sidebar.number_input("Min signals_score", value=0, step=1, key="min_sig")
-    min_comp = st.sidebar.number_input("Min composite_score", value=0.0, step=0.5, format="%.2f", key="min_comp")
+    norm_method = st.sidebar.selectbox(
+        "Score scaling",
+        ["Percentile (0–1)", "Robust min–max (5–95%)", "Min–max (full)"],
+        index=0,
+        help="How composite/signals are mapped to a 0–1, dataset-relative scale."
+    )
+    _norm_key = {"Percentile (0–1)": "percentile",
+                "Robust min–max (5–95%)": "winsor_minmax",
+                "Min–max (full)": "minmax"}[norm_method]
+    min_sig  = st.sidebar.number_input("Min signals (0–1, normalized)", 0.0, 1.0, 0.0, 0.05, key="min_sig")
+    min_comp = st.sidebar.number_input("Min composite (0–1, normalized)", 0.0, 1.0, 0.0, 0.05, key="min_comp")
     rsi_min, rsi_max = st.sidebar.slider("RSI range", 0, 100, (0, 100), key="rsi_range")
     owned_only = st.sidebar.checkbox("Owned only", value=False, key="owned_only")
     search = st.sidebar.text_input("Search ticker (substring)", value="", key="search")
@@ -390,11 +843,23 @@ def render_sidebar_filters(df: pd.DataFrame, cols: dict) -> tuple[pd.DataFrame, 
     if cols["owned"]:
         df[cols["owned"]] = _coerce_boolish(df[cols["owned"]])
 
-    mask = pd.Series(True, index=df.index)
-    if cols["sig"]:
-        mask &= df[cols["sig"]] >= min_sig
     if cols["comp"]:
-        mask &= df[cols["comp"]] >= min_comp
+        df[cols["comp"]] = _normalize_score_series(df[cols["comp"]])
+    if cols["sig"]:
+        df[cols["sig"]] = _normalize_score_series(df[cols["sig"]])
+
+    if cols["comp"]:
+        df["__comp_norm"] = _normalize_to_unit(df[cols["comp"]], method=_norm_key)
+        cols["comp_norm"] = "__comp_norm"
+    if cols["sig"]:
+        df["__sig_norm"] = _normalize_to_unit(df[cols["sig"]], method=_norm_key)
+        cols["sig_norm"] = "__sig_norm"
+
+    mask = pd.Series(True, index=df.index)
+    if cols.get("sig_norm"):
+        mask &= df["__sig_norm"] >= float(min_sig)
+    if cols.get("comp_norm"):
+        mask &= df["__comp_norm"] >= float(min_comp)
     if cols["rsi"]:
         mask &= df[cols["rsi"]].between(rsi_min, rsi_max)
     if owned_only and cols["owned"]:
@@ -502,7 +967,7 @@ def render_sidebar_filters(df: pd.DataFrame, cols: dict) -> tuple[pd.DataFrame, 
     # Sort
     st.sidebar.divider()
     st.sidebar.header("Sort")
-    sort_candidates = [c for c in [cols["comp"], cols["sig"], cols["rsi"], cols["last"], cols["date"]] if c]
+    sort_candidates = [c for c in [cols.get("comp_norm"), cols.get("sig_norm"),cols["comp"], cols["sig"], cols["rsi"], cols["last"], cols["date"]] if c]
     sort_choice = st.sidebar.selectbox("Primary sort", sort_candidates, index=0 if sort_candidates else 0, key="sort_choice")
     ascending   = st.sidebar.checkbox("Ascending", value=(sort_choice == cols["rsi"]), key="sort_asc")
 
@@ -512,16 +977,11 @@ def render_sidebar_filters(df: pd.DataFrame, cols: dict) -> tuple[pd.DataFrame, 
 
     return df_view, sort_choice or ""
 
-
 def pick_row_and_series(df_view: pd.DataFrame, cols: dict):
     """Row picker + extract OHLC & SMA series."""
     if df_view.empty:
         st.info("No rows match the current filters.")
         st.stop()
-
-    # Table columns picker (for Review tab)
-    default_cols = [c for c in [cols["ticker"], cols["comp"], cols["sig"], cols["rsi"], cols["last"], cols["owned"], cols["date"]] if c]
-    chosen_cols = st.multiselect("Columns to show", options=list(df_view.columns), default=default_cols, key="table_cols")
 
     # Row selection
     if cols["ticker"]:
@@ -538,6 +998,13 @@ def pick_row_and_series(df_view: pd.DataFrame, cols: dict):
     if x is None:
         st.warning("Selected row has empty or invalid series.")
         st.stop()
+
+    # Table columns picker (for Review tab)
+    default_cols = [c for c in ["Reco", cols["ticker"], cols.get("comp_norm"), cols.get("sig_norm"),
+                                cols["rsi"], cols["last"], cols["date"]]
+                    if c and (c == "Reco" or c in df_view.columns)]
+    chosen_cols = st.multiselect("Columns to show", options=list(df_view.columns),
+                                default=default_cols, key="table_cols")
 
     return row, chosen_cols, x, y_close, y_sma, y_open, y_high, y_low
 
@@ -592,6 +1059,16 @@ if any(c is None for c in required_any):
 
 # Sidebar: filters/sort (returns filtered view)
 df_view, _sort_col = render_sidebar_filters(df, cols)
+st.session_state["_comp_norm_col"] = cols.get("comp_norm")
+
+# Add quick recommendation column (uses normalized comp/sig)
+cn, sn = cols.get("comp_norm"), cols.get("sig_norm")
+if cn and sn and cn in df_view.columns and sn in df_view.columns and "Reco" not in df_view.columns:
+    df_view["Reco"] = [
+        _quick_reco_from_norm(float(c), float(s))
+        for c, s in zip(pd.to_numeric(df_view[cn], errors="coerce"),
+                        pd.to_numeric(df_view[sn], errors="coerce"))
+    ]
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Tabs
@@ -609,13 +1086,16 @@ with tab_review:
     row, chosen_cols, x, y_close, y_sma, y_open, y_high, y_low = pick_row_and_series(df_view, cols)
 
     column_config = {}
-    if cols["comp"] and cols["comp"] in df_view.columns:
-        column_config[cols["comp"]] = st.column_config.ProgressColumn(
-            "Composite", help="0–1", min_value=0.0, max_value=1.0, format="%.2f"
+    comp_col = cols.get("comp_norm") or cols["comp"]
+    sig_col  = cols.get("sig_norm")  or cols["sig"]
+
+    if comp_col and comp_col in df_view.columns:
+        column_config[comp_col] = st.column_config.ProgressColumn(
+            "Composite (norm)", help="0–1, dataset-relative", min_value=0.0, max_value=1.0, format="%.2f"
         )
-    if cols["sig"] and cols["sig"] in df_view.columns:
-        column_config[cols["sig"]] = st.column_config.ProgressColumn(
-            "Signals", help="Composite sub-score", min_value=0.0, max_value=1.0, format="%.2f"
+    if sig_col and sig_col in df_view.columns:
+        column_config[sig_col] = st.column_config.ProgressColumn(
+            "Signals (norm)", help="0–1, dataset-relative", min_value=0.0, max_value=1.0, format="%.2f"
         )
     if cols["rsi"] and cols["rsi"] in df_view.columns:
         column_config[cols["rsi"]] = st.column_config.ProgressColumn(
@@ -624,13 +1104,16 @@ with tab_review:
     if cols["owned"] and cols["owned"] in df_view.columns:
         column_config[cols["owned"]] = st.column_config.CheckboxColumn("Owned")
 
+    if "Reco" in df_view.columns:
+        column_config["Reco"] = st.column_config.TextColumn(
+            "Reco", help="Quick classification from normalized scores", width="small"
+        )
+
     st.dataframe(
         df_view[chosen_cols],
         use_container_width=True, hide_index=True,
         column_config=column_config
     )
-
-    st.dataframe(df_view[chosen_cols], use_container_width=True, hide_index=True)
 
     # Details & Risk band
     st.markdown("---")
@@ -889,7 +1372,7 @@ with tab_review:
     st.plotly_chart(fig, use_container_width=True)
 
     st.subheader("Scores & Status")
-    render_kpis(row, cols)
+    render_kpis(row, cols, x, y_close, y_sma, y_open, y_high, y_low, df_view)
 
     st.divider()
 
