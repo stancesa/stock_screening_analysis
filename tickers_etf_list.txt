@@ -1,0 +1,29 @@
+# --- Core U.S. sectors (SPDR Select Sector) ---
+US_SECTOR_ETFS = {
+    "Communication Services": "XLC",
+    "Consumer Discretionary": "XLY",
+    "Consumer Staples":       "XLP",
+    "Energy":                 "XLE",
+    "Financials":             "XLF",
+    "Health Care":            "XLV",
+    "Industrials":            "XLI",
+    "Materials":              "XLB",
+    "Real Estate":            "XLRE",
+    "Technology":             "XLK",
+    "Utilities":              "XLU",
+}
+
+# --- Broad U.S. proxies / style ---
+US_BROAD_ETFS = {
+    "Market": "SPY", "EqualWeight": "RSP", "Nasdaq100": "QQQ", "SmallCaps": "IWM",
+    "Value": "IWD",  "Growth": "IWF",      "Quality":   "QUAL", "Momentum": "MTUM",
+}
+
+# --- Canada (iShares) ---
+CA_BROAD_ETFS = {
+    "TSX_Composite": "XIC", "TSX_60": "XIU", "Canada_Bond": "XBB",
+}
+CA_SECTOR_ETFS = {
+    "Energy": "XEG", "Financials": "XFN", "Technology": "XIT",
+    "Real Estate": "XRE", "Utilities": "XUT", "Materials": "XMA",
+}

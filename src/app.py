@@ -15,6 +15,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
+import datetime as dt
 
 from core.paths import PROJECT_ROOT, DEFAULT_OUTPUT
 from core.io import DEFAULT_THEME,RECO_COLORS, load_theme, save_theme, _run_main_and_reload, _read_path_cached, save_profile, load_profile, list_profiles
@@ -31,15 +32,34 @@ from signals.series import compute_signal_series_for_row
 from signals.decision import _decide_action
 from signals.sweeps import param_grid
 
+from market_trends.market_regimen import MarketRegimenConfig, build_market_regime_section
+
 from sim.backtest import run_dca_backtest
 from sim.projection import _project_next_month
 from sim.metrics import compute_metrics
 
+from ui.sections import render_projection_defaults_section, render_overlays_defaults, render_perf_and_data_defaults
+
+from ui.css_elements import _inject_chip_css, _inject_tooltip_css, _inject_regimen_css, _fix_streamlit_clipping, _fix_streamlit_tooltip_overflow
+
+from market_trends.market_regimen import (
+    CATEGORY_WEIGHTS_DEFAULT,  # default category weights
+    compute_category_scores,   # fallback if score_blocks not present
+    combine_category_scores    # fallback combiner
+)
+from market_trends.components import CATEGORY_LABELS, CATEGORY_HELP, CATEGORY_ORDER
 
 # ────────────────────────────────────────────────────────────────────────────────
 # App bootstrap
 # ────────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Ticker Evaluator", layout="wide")
+
+
+_inject_tooltip_css()
+_inject_chip_css()
+_inject_regimen_css()
+_fix_streamlit_tooltip_overflow()
+_fix_streamlit_clipping()
 
 # Make console output UTF-8 friendly (best effort)
 try:
@@ -99,6 +119,55 @@ def get_settings() -> dict:
 st.title("📈 Ticker Evaluator — Interactive Review")
 st.caption("Load scanner CSV/XLSX, filter/sort, overlay technicals, and inspect setups. You can also re-run the scan.")
 
+# ────────────────────────────────────────────────────────────────────────────────
+# Type helpers
+# ────────────────────────────────────────────────────────────────────────────────
+
+def _as_scalar(x):
+    """Convert pandas/NumPy objects to plain Python scalars (use last non-NaN if Series)."""
+    import numpy as np
+    import pandas as pd
+
+    if isinstance(x, pd.Series):
+        if x.empty:
+            return None
+        # Prefer last non-NaN; else just last
+        xx = x.dropna()
+        v = xx.iloc[-1] if not xx.empty else x.iloc[-1]
+        return _as_scalar(v)
+    if isinstance(x, (pd.Timestamp, np.datetime64)):
+        return pd.Timestamp(x).to_pydatetime()
+    if isinstance(x, np.generic):
+        # numpy scalar → Python scalar
+        try:
+            return x.item()
+        except Exception:
+            return float(x) if np.issubdtype(x, np.number) else str(x)
+    if isinstance(x, (list, tuple, np.ndarray)):
+        return [ _as_scalar(v) for v in x ]
+    return x
+
+def _sanitize_dict(obj):
+    """Recursively sanitize dicts/lists into Python types (no Series inside)."""
+    if isinstance(obj, dict):
+        return {k: _sanitize_dict(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [ _sanitize_dict(v) for v in obj ]
+    return _as_scalar(obj)
+
+def _truthy(x) -> bool:
+    """Deterministic boolean for possibly-Sequence inputs."""
+    import numpy as np
+    import pandas as pd
+    if isinstance(x, (bool, np.bool_)):
+        return bool(x)
+    if isinstance(x, pd.Series):
+        if x.empty:
+            return False
+        return bool(_as_scalar(x))
+    if isinstance(x, np.ndarray):
+        return bool(np.any(x))
+    return bool(x)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Small UI helpers 
@@ -138,77 +207,14 @@ def ui_run_scan_and_choose_source(default_path: str) -> tuple[Optional[io.BytesI
     prefer_output = (source_choice == "Latest generated")
     return uploaded, path_text, prefer_output
 
-def _inject_chip_css():
-    if st.session_state.get("_chip_css_injected_v8"):  # bump the flag
-        return
-    st.session_state["_chip_css_injected_v8"] = True
 
-    st.markdown("""
-    <style>
-      /* Recommendation badge */
-      .reco-badge {
-        display:inline-block; padding:6px 10px; border-radius:999px;
-        font-weight:700; font-size:12px; line-height:1;
-        box-shadow: inset 0 1px 0 rgba(255,255,255,.18), 0 2px 6px rgba(0,0,0,.25);
-        border:1px solid rgba(0,0,0,.12);
-        color:#fff;
-      }
-      .reco-strongbuy  { background:#008000; }  /* Solid Green   */
-      .reco-buy        { background:#90EE90; }  /* Light Green   */
-      .reco-hold       { background:#FFFF00; }  /* Yellow        */
-      .reco-sell       { background:#FFA500; }  /* Orange        */
-      .reco-strongsell { background:#FF0000; }  /* Vivid Red     */
-      
-      .kpi-row { display:flex; flex-wrap:wrap; gap:10px; align-items:flex-start; margin:6px 0; }
-      .kpi-chip {
-        position: relative;
-        display:inline-flex; align-items:center; gap:10px;
-        padding:8px 12px; border-radius:999px; font-weight:600; font-size:13px; line-height:1;
-        backdrop-filter: blur(6px);
-        border:1px solid rgba(255,255,255,.14);
-        box-shadow: inset 0 1px 0 rgba(255,255,255,.18), 0 2px 6px rgba(0,0,0,.25);
-        color: var(--chip-fg, #0f172a);
-      }
-      .kpi-chip .val {
-        font-variant-numeric: tabular-nums;
-        padding:3px 8px; border-radius:999px;
-        background: var(--chip-badge-bg, rgba(255,255,255,.25));
-        border:1px solid rgba(255,255,255,.22);
-        color: inherit;
-      }
-      .kpi-chip:hover { transform: translateY(-1px); transition: transform .15s ease; }
 
-      /* Tooltip container (inside the chip) */
-      .kpi-tip {
-        position:absolute;
-        top:50%; left:100%;
-        transform: translate(10px, -50%);
-        display:none;
-        padding:12px 14px; border-radius:12px;
-        max-width:none; white-space:nowrap; word-break:normal; overflow-wrap:normal;
-        box-shadow:0 14px 40px rgba(0,0,0,.28), inset 0 1px 0 rgba(255,255,255,.08);
-        z-index:2147483000;  /* above plotly etc */
-      }
-      .kpi-row, .kpi-chip { overflow: visible; }     
-      .kpi-chip { position: relative; }
-      .kpi-chip:hover > .kpi-tip { display:block; }               
-      .kpi-chip:hover {                                     
-        transform: translateY(-1px);
-        transition: transform .15s ease;
-        z-index: 2147483647;
-      }
-    .kpi-tip { z-index: 2147483000; }               
-
-      /* Optional inner typography */
-      .kpi-tip h5 { margin:0 0 6px 0; font-size:13px; }
-      .kpi-tip .section { margin-top:8px; font-size:12px; line-height:1.35; }
-      .kpi-tip ul { margin:4px 0 0 18px; padding:0; }
-      .kpi-tip li { margin:2px 0; }
-      .kpi-tip table { width:100%; border-collapse:collapse; font-size:12px; }
-      .kpi-tip th, .kpi-tip td { padding:2px 0; }
-      .kpi-tip thead th { text-align:left; }
-      .kpi-tip td[style*="text-align:right"] { text-align:right; }
-    </style>
+def chip(label: str, help_text: str):
+    st.markdown(f"""
+      <span class="chip">
+        {label}
+        <span class="tip">{help_text}</span>
+      </span>
     """, unsafe_allow_html=True)
 
 def _reco_tip_html(buy_score: float, sell_score: float, params, reco_label: str) -> str:
@@ -747,6 +753,269 @@ def render_kpis(
     ]
     kpi_row(chips, scale=1.35)
 
+def _risk_hex(score: float | None) -> str:
+    if score is None: return "#d1d5db"
+    anchors = [
+        (0,  (0x16,0xa3,0x4a)),  # green
+        (30, (0x84,0xcc,0x16)),  # lime
+        (60, (0xf5,0x9e,0x0b)),  # amber
+        (80, (0xef,0x44,0x44)),  # red
+        (100,(0x7f,0x1d,0x1d)),  # deep red
+    ]
+    s = max(0, min(100, int(round(float(score)))))
+    for i in range(len(anchors)-1):
+        s0,c0 = anchors[i]; s1,c1 = anchors[i+1]
+        if s0 <= s <= s1:
+            t = (s - s0) / (s1 - s0 + 1e-9)
+            mix = tuple(int(round(c0[k] + t*(c1[k]-c0[k]))) for k in range(3))
+            return f"#{mix[0]:02x}{mix[1]:02x}{mix[2]:02x}"
+    r,g,b = anchors[-1][1]; return f"#{r:02x}{g:02x}{b:02x}"
+
+def _fmt_pct(x, nd=1):
+    return "" if x is None else f"{x:.{nd}f}%"
+
+def _fmt_float(x, nd=2):
+    return "" if x is None else f"{x:.{nd}f}"
+
+def render_market_sentiment_dashboard(mr: dict):
+    """
+    Beautiful per-category sentiment + interactive weights → recomputed headline.
+    Expects mr to contain:
+      - 'score_blocks': {category: score in [0,100]}
+      - 'score_blocks_details': {category: {'parts': {...}}}
+      - 'headline_score_0_100', 'headline_regime'   (optional; we recompute anyway)
+    """
+    # Fallback: if score_blocks missing, compute from raw features
+    if not mr.get("score_blocks"):
+        try:
+            cats = compute_category_scores(mr)
+            mr["score_blocks_details"] = cats
+            mr["score_blocks"] = {k: (cats[k].get("score")) for k in cats.keys()}
+        except Exception:
+            mr["score_blocks"] = {}
+
+    scores: dict[str, float | None] = mr.get("score_blocks", {}) or {}
+    details: dict = mr.get("score_blocks_details", {}) or {}
+
+    # Canonical order from the regimen module; fall back to the dict order
+    default_order = list(CATEGORY_WEIGHTS_DEFAULT.keys())
+    cat_order = [c for c in default_order if c in scores] + [c for c in scores.keys() if c not in default_order]
+
+    # Session-scoped adjustable weights
+    if "mr_weights" not in st.session_state or not st.session_state["mr_weights"]:
+        st.session_state["mr_weights"] = {k: CATEGORY_WEIGHTS_DEFAULT.get(k, 0.1) for k in cat_order}
+
+    palette = _category_palette()
+    icons   = _category_icons()
+
+    st.markdown("### 🌐 Market Sentiment Dashboard")
+
+    # ——— Top: headline gauge (from adjustable weights) ———
+    c_top1, c_top2 = st.columns([1.3, 1])
+    with c_top1:
+        # ── Callouts (top): strongest / weakest / dispersion ──────────────────────
+        try:
+            theta = cat_order
+            rvals = [float(scores.get(k) or 0.0) for k in theta]
+
+            # Normalized weights (from session) for both the radar and treemap
+            w_raw  = st.session_state.get(
+                "mr_weights", {k: CATEGORY_WEIGHTS_DEFAULT.get(k, 0.1) for k in theta}
+            )
+            w_norm = _norm_weights(w_raw)             # sums to 1.0
+            wvals  = [w_norm.get(k, 0.0) * 100.0 for k in theta]  # ×100 only for the ring
+
+            # Callouts
+            pairs = [(k, float(scores.get(k) or float("nan"))) for k in theta]
+            pairs = [p for p in pairs if np.isfinite(p[1])]
+            if pairs:
+                top_cat, top_val = max(pairs, key=lambda p: p[1])
+                bot_cat, bot_val = min(pairs, key=lambda p: p[1])
+                disp = float(np.nanstd([v for _, v in pairs]))  # cross-category dispersion
+
+                palette = _category_palette()
+                chips = [
+                    (
+                        "Strongest",
+                        f"{top_cat.title()} {top_val:.1f}",
+                        palette.get(top_cat, "#16a34a"),
+                        "🏆",
+                        {"html": _parts_tooltip_html(top_cat, (details.get(top_cat) or {}).get("parts")),
+                        "max_width": 460},
+                    ),
+                    (
+                        "Weakest",
+                        f"{bot_cat.title()} {bot_val:.1f}",
+                        palette.get(bot_cat, "#ef4444"),
+                        "⚠️",
+                        {"html": _parts_tooltip_html(bot_cat, (details.get(bot_cat) or {}).get("parts")),
+                        "max_width": 460},
+                    ),
+                    ("Dispersion σ", f"{disp:.1f}", "#64748b", "📐"),
+                ]
+                kpi_row(chips, scale=1.05)
+        except Exception:
+            pass
+
+        # ── Radar (middle) — your upgraded version ────────────────────────────────
+        try:
+            # (reuse theta, rvals, w_norm, wvals from above)
+            point_colors = [_category_palette().get(k, "#22c55e") for k in theta]
+            tmpl  = get_settings()["chart"].get("template", "plotly_white")
+            dark  = _is_dark_theme()
+            txt   = "#e5e7eb" if dark else "#0f172a"
+            grid  = "rgba(255,255,255,.18)" if dark else "rgba(0,0,0,.15)"
+            accent = th.get("overlay", "#22c55e")
+            r,g,b = _hex_to_rgb(accent)
+
+            fig_radar = go.Figure()
+            fig_radar.add_trace(go.Scatterpolar(
+                r=wvals + wvals[:1], theta=theta + theta[:1],
+                mode="lines",
+                line=dict(color="rgba(71,85,105,0.75)" if not dark else "rgba(148,163,184,0.85)", dash="dot", width=2),
+                hovertemplate="<b>%{theta}</b><br>Weight: %{r:.1f} (×100)<extra>Weights</extra>",
+                name="Weights (×100)"
+            ))
+            fig_radar.add_trace(go.Scatterpolar(
+                r=rvals + rvals[:1], theta=theta + theta[:1],
+                mode="lines", fill="toself",
+                line=dict(color=accent, width=3),
+                fillcolor=f"rgba({r},{g},{b},0.20)",
+                hovertemplate="<b>%{theta}</b><br>Score: %{r:.1f}<extra>Score</extra>",
+                name="Category score"
+            ))
+            fig_radar.add_trace(go.Scatterpolar(
+                r=rvals, theta=theta, mode="markers",
+                marker=dict(size=9, color=point_colors, line=dict(width=1, color="white")),
+                customdata=[w_norm.get(k, 0.0) * 100.0 for k in theta],
+                hovertemplate="<b>%{theta}</b><br>Score: %{r:.1f}<br>Weight: %{customdata:.1f} (×100)<extra></extra>",
+                name="", showlegend=False
+            ))
+            fig_radar.update_layout(
+                template=tmpl,
+                height=300,  # slightly shorter to make room for treemap below
+                margin=dict(l=8, r=8, t=10, b=8),
+                paper_bgcolor="rgba(0,0,0,0)",
+                font=dict(color=txt),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                polar=dict(
+                    bgcolor="rgba(0,0,0,0)",
+                    radialaxis=dict(
+                        range=[0, 100], tickvals=[0, 25, 50, 75, 100],
+                        gridcolor=grid, gridwidth=1, tickfont=dict(size=11)
+                    ),
+                    angularaxis=dict(
+                        gridcolor=grid, linecolor=grid, tickfont=dict(size=12),
+                        direction="clockwise", rotation=90
+                    ),
+                ),
+                showlegend=True,
+            )
+            st.plotly_chart(fig_radar, use_container_width=True)
+        except Exception:
+            st.caption("Radar unavailable for current data.")
+
+        # ── Weights vs. Scores treemap (bottom) — fills leftover space ────────────
+        try:
+            labels  = theta
+            parents = ["Market"] * len(labels)
+            values  = [w_norm.get(k, 0.0) * 100.0 for k in labels]               # tile size = weight (%)
+            colors  = [float(scores.get(k) or 0.0) for k in labels]               # tile color = score
+
+            # Map 0→green .. 100→deep red to align with your gauge palette
+            cs = [
+                [0.00,  "#16a34a"],
+                [0.30,  "#84cc16"],
+                [0.60,  "#f59e0b"],
+                [0.80,  "#ef4444"],
+                [1.00,  "#7f1d1d"],
+            ]
+
+            fig_tree = go.Figure(go.Treemap(
+                labels=labels,
+                parents=parents,
+                values=values,
+                marker=dict(colors=colors, colorscale=cs, cmin=0, cmax=100),
+                branchvalues="total",
+                pathbar=dict(visible=False),
+                texttemplate="<b>%{label}</b><br>%{value:.1f}% • %{color:.1f}",
+                hovertemplate="<b>%{label}</b><br>Weight: %{value:.1f}%<br>Score: %{color:.1f}<extra></extra>",
+            ))
+            fig_tree.update_layout(
+                height=240,
+                margin=dict(l=4, r=4, t=4, b=4),
+                template=get_settings()["chart"].get("template", "plotly_white"),
+            )
+            st.plotly_chart(fig_tree, use_container_width=True)
+        except Exception:
+            pass
+
+    with c_top2:
+        # Sliders to adjust weights
+        with st.expander("Adjust category weights", expanded=True):
+            new_w = {}
+            for k in cat_order:
+                new_w[k] = st.slider(f"{k}", 0.0, 1.0, float(st.session_state["mr_weights"].get(k, CATEGORY_WEIGHTS_DEFAULT.get(k, 0.0))), 0.01)
+            if st.button("Reset weights to defaults"):
+                st.session_state["mr_weights"] = {k: CATEGORY_WEIGHTS_DEFAULT.get(k, 0.1) for k in cat_order}
+            else:
+                st.session_state["mr_weights"] = new_w
+
+        weights_norm = _norm_weights(st.session_state["mr_weights"])
+        headline = _weighted_headline_from(scores, weights_norm)
+        lbl = _headline_label(headline)
+
+        # Gauge
+        fig_g = go.Figure(go.Indicator(
+            mode="gauge+number",
+            value=headline,
+            number=dict(suffix=""),
+            title={"text": f"{lbl}"},
+            gauge=dict(
+                axis=dict(range=[0,100]),
+                steps=[
+                    {"range":[0,30], "color":"#16a34a"},
+                    {"range":[30,60], "color":"#84cc16"},
+                    {"range":[60,80], "color":"#f59e0b"},
+                    {"range":[80,100],"color":"#ef4444"},
+                ],
+                bar=dict(thickness=0.25)
+            )
+        ))
+        fig_g.update_layout(height=220, margin=dict(l=10,r=10,t=40,b=10),
+                            template=get_settings()["chart"].get("template","plotly_white"))
+        st.plotly_chart(fig_g, use_container_width=True)
+        # Show the normalized weights table
+        wdf = pd.DataFrame({"Category": list(weights_norm.keys()), "Weight": list(weights_norm.values())})
+        wdf["Weight"] = wdf["Weight"].map(lambda x: f"{x*100:.1f}%")
+        st.dataframe(wdf, hide_index=True, use_container_width=True)
+
+    # ——— Middle: category chips with tooltips ———
+    st.markdown("#### Category scores")
+    chips = []
+    for k in cat_order:
+        val = scores.get(k)
+        color = palette.get(k, "#22c55e")
+        icon  = icons.get(k, "📊")
+        hv_html = _parts_tooltip_html(k, (details.get(k) or {}).get("parts"))
+        chips.append((k.title(), f"{'' if val is None else f'{float(val):.1f}'}", color, icon, {"html": hv_html, "max_width": 520}))
+    kpi_row(chips, scale=1.15)
+
+    # ——— Bottom: bar chart ———
+    try:
+        x = cat_order
+        y = [float(scores.get(k) or 0.0) for k in x]
+        bar_colors = [palette.get(k, "#22c55e") for k in x]
+        fig_bar = go.Figure(go.Bar(x=x, y=y, marker_color=bar_colors, name="Score"))
+        fig_bar.update_yaxes(range=[0,100], title="Score (0–100)")
+        fig_bar.update_layout(height=360, margin=dict(l=10,r=10,t=10,b=10),
+                              template=get_settings()["chart"].get("template","plotly_white"))
+        st.plotly_chart(fig_bar, use_container_width=True)
+    except Exception:
+        pass
+
+    # Derived, for convenience elsewhere in the page
+    st.session_state["mr_headline_custom"] = {"score": headline, "label": lbl, "weights": weights_norm}
 
 def _read_any_table(uploaded_file: Optional[io.BytesIO], path_text: str, prefer_output: bool) -> tuple[pd.DataFrame, str, Optional[Tuple[List[str], str]]]:
     """
@@ -1032,10 +1301,112 @@ def theme_controls():
         save_theme(th)
         st.caption("✅ Theme saved")
 
+# ────────────────────────────────────────────────────────────────────────────────
+# Market Sentiment Dashboard helpers
+# ────────────────────────────────────────────────────────────────────────────────
+def _norm_weights(d: dict[str, float]) -> dict[str, float]:
+    pairs = [(k, float(v) if v is not None else 0.0) for k, v in d.items()]
+    total = sum(max(0.0, v) for _, v in pairs)
+    if total <= 0:
+        n = max(1, len(pairs))
+        return {k: 1.0 / n for k, _ in pairs}
+    return {k: max(0.0, v) / total for k, v in pairs}
+
+def _headline_label(score: float) -> str:
+    if score >= 75.0: return "Risk-On (Strong)"
+    if score >= 60.0: return "Risk-On"
+    if score >  40.0: return "Neutral"
+    return "Risk-Off"
+
+def _category_palette() -> dict[str, str]:
+    # Pleasant, distinct accents for chips/plots
+    return {
+        "equities":    "#16a34a",
+        "breadth":     "#10b981",
+        "vol":         "#3b82f6",
+        "rates_credit":"#0ea5e9",
+        "fx":          "#a855f7",
+        "intl":        "#f59e0b",
+        "commodities": "#f97316",
+        "reits":       "#8b5cf6",
+        "crypto":      "#ef4444",
+        "internals":   "#64748b",
+    }
+
+def _category_icons() -> dict[str, str]:
+    return {
+        "equities":"📈","breadth":"🧺","vol":"🌪️","rates_credit":"🏦",
+        "fx":"💱","intl":"🌍","commodities":"⛏️","reits":"🏢","crypto":"🪙","internals":"🧭"
+    }
+
+def _parts_tooltip_html(cat: str, parts: dict | None) -> str:
+    if not parts: return ""
+    # Show top 6 contributors by absolute value, readable table
+    try:
+        items = sorted(parts.items(), key=lambda kv: (0 if kv[1] is None else -abs(float(kv[1]))))[:6]
+    except Exception:
+        items = list(parts.items())[:6]
+    rows = "".join(
+        f"<tr><td style='padding:2px 6px'>{_html.escape(str(k))}</td>"
+        f"<td style='padding:2px 6px;text-align:right'>{'' if v is None else f'{float(v):.1f}'}</td></tr>"
+        for k, v in items
+    )
+    return f"""
+    <div class="section">
+      <h5>{_html.escape(cat.title())} — components</h5>
+      <table style="width:100%;border-collapse:collapse;font-size:12px">
+        <thead><tr><th style='text-align:left'>Part</th><th style='text-align:right'>Score</th></tr></thead>
+        <tbody>{rows or '<tr><td colspan="2">—</td></tr>'}</tbody>
+      </table>
+    </div>
+    """
+
+def _weighted_headline_from(cat_scores: dict[str, float | None], weights: dict[str, float]) -> float:
+    ws = _norm_weights(weights)
+    num, den = 0.0, 0.0
+    for k, w in ws.items():
+        v = cat_scores.get(k)
+        if v is None or not np.isfinite(v): 
+            continue
+        num += float(v) * float(w)
+        den += float(w)
+    if den <= 0: 
+        return 50.0
+    return float(np.clip(num / den, 0.0, 100.0))
+
+def render_weight_sliders(defaults: dict[str,float]) -> dict[str,float]:
+    import streamlit as st
+    with st.expander("Adjust category weights", expanded=False):
+        st.caption("These control how the headline regime score is combined. Hover the (?) for details.")
+        current = st.session_state.get("headline_weights", defaults).copy()
+
+        new_weights = {}
+        for key in CATEGORY_ORDER:
+            label = CATEGORY_LABELS.get(key, key.title())
+            help_txt = CATEGORY_HELP.get(key, "")
+            new_weights[key] = st.slider(
+                label=label,
+                min_value=0.00, max_value=0.40, value=float(current.get(key, defaults[key])),
+                step=0.01, help=help_txt, key=f"wt_{key}"
+            )
+
+        total = sum(new_weights.values())
+        st.caption(f"Sum of sliders: **{total:.2f}**  (we normalize to 1.00 under the hood)")
+
+        # Normalize to sum=1.00 so downstream math is stable
+        if total <= 0:
+            normed = defaults.copy()
+        else:
+            normed = {k: v/total for k, v in new_weights.items()}
+
+        st.session_state["headline_weights"] = normed
+        return normed
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Data source & load (shared across tabs)
 # ────────────────────────────────────────────────────────────────────────────────
+_inject_tooltip_css()
+
 uploaded, path_text, prefer_output = ui_run_scan_and_choose_source(DEFAULT_OUTPUT.as_posix())
 df, loaded_msg, sheets_info = _read_any_table(uploaded, path_text, prefer_output)
 st.caption(loaded_msg)
@@ -1070,12 +1441,36 @@ if cn and sn and cn in df_view.columns and sn in df_view.columns and "Reco" not 
                         pd.to_numeric(df_view[sn], errors="coerce"))
     ]
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _get_market_regime_cached() -> dict:
+    end = pd.Timestamp.today().normalize()
+    start = end - pd.Timedelta(days=400)
+    cfg = MarketRegimenConfig()
+    from core.utils import fetch_history
+    raw = build_market_regime_section(cfg, fetch_history, start, end)
+    return _sanitize_dict(raw)
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Tabs
 # ────────────────────────────────────────────────────────────────────────────────
-tab_review, tab_signals, tab_backtest, tab_settings, tab_profiles = st.tabs(
-    ["📊 Review", "🧠 Signals", "🧪 Backtest", "⚙️ Settings", "💾 Profiles"]
+tab_market, tab_review, tab_signals, tab_backtest, tab_settings, tab_profiles = st.tabs(
+    ["🌐 Market Sentiment", "📊 Review", "🧠 Signals", "🧪 Backtest", "⚙️ Settings", "💾 Profiles"]
 )
+
+# ────────────────────────────────────────────────────────────────────────
+# 🌐 MARKET REGIME TAB
+# ────────────────────────────────────────────────────────────────────────
+
+with tab_market:
+    st.subheader("Global Market Regime")
+    try:
+        market_regime = _get_market_regime_cached()
+    except Exception:
+        st.error("Market regime unavailable.")
+    else:
+        # Optional: custom CSS if you want the extra styling you defined
+        # _inject_regimen_css()
+        render_market_sentiment_dashboard(market_regime)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # 📊 REVIEW TAB
@@ -1849,45 +2244,18 @@ with tabA:
             st.rerun()
 
     # ── Overlays ───────────────────────────────────────────────────────────────
-    with tabD:
-        current = s["overlays"]["defaults"]
-        all_opts = list(TECHNICALS_REGISTRY.keys())
-        s["overlays"]["defaults"] = st.multiselect("Default overlays", options=all_opts, default=current)
-        st.caption("These appear selected by default in Review → Overlays.")
+    with tabD:  # Overlays
+        render_overlays_defaults(
+            s,
+            all_opts=list(TECHNICALS_REGISTRY.keys())
+        )
 
     # ── Performance & Data ─────────────────────────────────────────────────────
-    with tabE:
-        st.caption("Plotly layout + data source stickies.")
-        s["chart"]["plot_height"] = int(st.number_input("Plot height (px)", min_value=360, max_value=1200, value=int(s["chart"]["plot_height"]), step=20, key="perf_height"))
-        s["chart"]["hovermode"] = st.selectbox("Hover mode", ["x unified","closest","x"], index=["x unified","closest","x"].index(s["chart"]["hovermode"]), key="perf_hover")
-        st.divider()
-        s["data"]["source_choice"] = st.selectbox("Default data source", ["Latest generated","Upload file","Path"],
-                                                  index=["Latest generated","Upload file","Path"].index(s["data"]["source_choice"]))
-        s["data"]["default_path"] = st.text_input("Default path", value=s["data"]["default_path"])
-
-        st.divider()
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            if st.button("Reset ALL settings to defaults"):
-                st.session_state.app_settings = deepcopy(DEFAULT_SETTINGS)
-                st.success("Settings reset.")
-                st.experimental_rerun()
-        with col2:
-            # Export settings
-            st.download_button("Download settings JSON", data=json.dumps(s, indent=2).encode("utf-8"),
-                               file_name="app_settings.json", mime="application/json")
-        with col3:
-            up = st.file_uploader("Import settings JSON", type=["json"])
-            if up is not None:
-                try:
-                    loaded = json.load(up)
-                    # naive merge: only update known top-level keys
-                    for k in DEFAULT_SETTINGS.keys():
-                        if k in loaded and isinstance(loaded[k], dict):
-                            s[k].update(loaded[k])
-                    st.success("Settings imported.")
-                except Exception as e:
-                    st.error(f"Invalid JSON: {e}")
+    with tabE:  # Performance & Data
+        render_perf_and_data_defaults(
+            s,
+            DEFAULT_SETTINGS  # pass the dict so the function can reset/import safely
+        )
 
 # ────────────────────────────────────────────────────────────────────────────────
 # 💾 PROFILES TAB

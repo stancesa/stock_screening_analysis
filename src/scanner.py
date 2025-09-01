@@ -14,12 +14,16 @@ from collections import OrderedDict
 from dataclasses import dataclass
 
 from .config import ScannerConfig
-from .utils import read_list, fetch_history, market_risk_ok
-from .indicators import (
-    rsi, macd, bullish_macd_cross,
-    ema, atr, donchian, swing_low, bollinger
-)
-from .news_fundamentals import get_news_and_sentiment, get_fundamentals
+from core.utils import read_list, fetch_history, market_risk_ok, read_merged_list, _parse_list_lines
+from .indicators.indicators_lib import rsi, macd, bullish_macd_cross, ema, atr, donchian, swing_low, bollinger
+
+from .indicators.news_fundamentals import get_news_and_sentiment, get_fundamentals
+
+from functools import lru_cache
+from .market_trends.etf_sector_analysis import sector_trend_score, extract_all_etfs, sector_mix_for_ticker, mix_concentration_stats, sector_corr_affinity
+
+
+from .core.log import get_log, log_value
 
 SECTION_ORDER = [
     "meta",
@@ -33,61 +37,34 @@ SECTION_ORDER = [
     "position_sizing",
     "fundamentals_and_sentiment",
     "series",
+    "sector_analysis",
 ]
 
-# ---------------- logging ----------------
+TREND_BUCKETS = [
+    (-1.01, -0.60, "Strong Down"),
+    (-0.60, -0.20, "Down"),
+    (-0.20,  0.20, "Chop/Flat"),
+    ( 0.20,  0.60, "Up"),
+    ( 0.60,  1.01, "Strong Up"),
+]
 
-def setup_logging():
-    """Idempotent logging setup with ticker-aware adapter."""
-    if getattr(setup_logging, "_configured", False):
-        return
-    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
-    level = getattr(logging, level_name, logging.INFO)
 
-    root = logging.getLogger()
-    if not root.handlers:
-        handler = logging.StreamHandler()
-        fmt = (
-            '%(asctime)s %(levelname)s '
-            '[%(name)s] '
-            '%(message)s'
-        )
-        handler.setFormatter(logging.Formatter(fmt))
-        root.addHandler(handler)
-    root.setLevel(level)
-    setup_logging._configured = True
+# Default sector->ETF map 
+DEFAULT_SECTOR_ETF_MAP = {
+    "Communication Services": "XLC",
+    "Consumer Discretionary": "XLY",
+    "Consumer Staples": "XLP",
+    "Energy": "XLE",
+    "Financials": "XLF",
+    "Health Care": "XLV",
+    "Industrials": "XLI",
+    "Information Technology": "XLK",
+    "Materials": "XLB",
+    "Real Estate": "XLRE",
+    "Utilities": "XLU",
+}
 
-setup_logging()
-_logger = logging.getLogger(__name__)
 
-class TickerLogger(LoggerAdapter):
-    def process(self, msg, kwargs):
-        prefix = ""
-        if self.extra and self.extra.get("ticker"):
-            prefix = f"[{self.extra['ticker']}] "
-        return prefix + str(msg), kwargs
-
-def get_log(ticker: Optional[str] = None) -> TickerLogger:
-    return TickerLogger(_logger, {"ticker": ticker})
-
-def log_value(log: TickerLogger, name: str, val, level=logging.DEBUG, sample_n: int = 3):
-    """Log type/shape/preview for debugging mysterious values."""
-    info = {"name": name, "type": type(val).__name__}
-    try:
-        if isinstance(val, pd.DataFrame):
-            info["shape"] = list(val.shape)
-            info["columns"] = list(map(str, val.columns[:10]))
-        elif isinstance(val, pd.Series):
-            info["shape"] = [len(val)]
-            info["head"] = val.head(sample_n).tolist()
-        elif isinstance(val, np.ndarray):
-            info["shape"] = list(val.shape)
-            info["sample"] = val.ravel()[:sample_n].tolist()
-        else:
-            info["value"] = val if isinstance(val, (int, float, str, bool, type(None))) else repr(val)
-    except Exception as e:
-        info["error"] = f"failed_introspect: {e}"
-    log.log(level, "VALUE %s", json.dumps(info, default=str))
 
 # ---------- helpers ----------
 
@@ -160,65 +137,33 @@ def _pct_slope(series: pd.Series, window: int = 50):
         return None
     return (m / y[-1]) * 100.0
 
-def _iter_file_lines(paths: Iterable[Union[str, Path]]) -> Iterable[str]:
-    """Yield lines from one or more files. Ignores missing files with a warning."""
-    for p in paths:
-        p = Path(p)
-        if not p.exists():
-            get_log().warning("File not found (skipping): %s", p)
-            continue
-        with p.open("r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                yield line
+def _categorize_trend(score: Optional[float]) -> Optional[str]:
+    if score is None or not np.isfinite(score):
+        return None
+    for lo, hi, name in TREND_BUCKETS:
+        if lo <= score < hi:
+            return name
+    return "Chop/Flat"
 
-def _parse_list_lines(lines: Iterable[str]) -> List[str]:
-    """
-    Parse lines into items:
-      - trims whitespace
-      - removes full-line comments (# ... )
-      - removes inline comments (e.g. AAPL  # watchlist)
-      - skips empty lines
-      - preserves order while dropping duplicates
-    """
-    items = []
-    seen = set()
-    for raw in lines:
-        line = raw.strip()
-        if not line:
-            continue
-        if line.startswith("#"):
-            continue
-        # strip inline comments
-        if "#" in line:
-            line = line.split("#", 1)[0].strip()
-        if not line:
-            continue
-        # optional: allow comma-separated on a single line
-        for tok in [t.strip() for t in line.split(",")]:
-            if not tok:
-                continue
-            # normalize tickers (optional): upper-case
-            tok_norm = tok.upper()
-            if tok_norm not in seen:
-                seen.add(tok_norm)
-                items.append(tok_norm)
-    return items
-
-def read_merged_list(files: Union[str, Path, Iterable[Union[str, Path]]]) -> List[str]:
-    """
-    Read and coalesce one or many files into a single ordered list.
-    Accepts a single path or an iterable of paths.
-    """
-    if isinstance(files, (str, Path)):
-        files = [files]
-    return _parse_list_lines(_iter_file_lines(files))
+@lru_cache(maxsize=64)
+def _cached_close_series(symbol: str, start: dt.date, end: dt.date) -> Optional[pd.Series]:
+    df = fetch_history(symbol, start, end)
+    if df is None or df.empty:
+        return None
+    s = df["Close"]
+    if isinstance(s, pd.DataFrame):
+        s = s.iloc[:, 0]
+    return s.rename(symbol)
 
 # ---------- builders ----------
 
 def build_structured_record(
     ticker, entry_price, stop_price, target_price, risk_reward,
     per_trade_risk, alloc_cap, shares_suggested, cfg,
-    sn, fn, tech, composite, sentiment_val
+    sn, fn, tech, composite, sentiment_val,
+    trend_category, trend_score,
+    etf_category=None, etf_category_share=None, etf_category_hhi=None,
+    corr_category=None, corr_strength=None, corr_map=None,
 ):
     log = get_log(ticker)
     # Basic context
@@ -348,6 +293,20 @@ def build_structured_record(
             "sma200_series": _to_1d_list(tech.get("sma200_series", [])),
             "dates_series": tech.get("dates_series", []),
         }),
+        "sector_analysis": OrderedDict({
+            "trend_category": trend_category,
+            "trend_score_26w": safe_round(trend_score, 3) if trend_score is not None else None,
+
+            # Category from ETF holdings + concentration
+            "etf_category": etf_category,
+            "etf_category_share": safe_round(etf_category_share, 3) if etf_category_share is not None else None, 
+            "etf_category_hhi": safe_round(etf_category_hhi, 3) if etf_category_hhi is not None else None,
+
+            # Behavior correlation to sector ETFs
+            "corr_category": corr_category,
+            "corr_strength": safe_round(corr_strength, 3) if corr_strength is not None else None,
+            "corr_map": corr_map or {},
+        }),
     }
     log.debug("Structured record built")
     return OrderedDict((sec, rec[sec]) for sec in SECTION_ORDER if sec in rec)
@@ -375,6 +334,21 @@ def technicals(df: pd.DataFrame, cfg: ScannerConfig) -> Dict[str, Any]:
             close = close_obj.iloc[:, 0]
         else:
             close = close_obj
+
+        # --- Weekly trend score over a lookback window ---
+        trend_lookback = getattr(cfg, "trend_lookback_wks", 26)
+
+        # ensure a proper weekly series (Friday close is common)
+        close_w = close.resample("W-FRI").last().dropna()
+
+        trend_series = sector_trend_score(close_w, lookback_wks=trend_lookback)
+
+        trend_score = None
+        if isinstance(trend_series, pd.Series) and len(trend_series) > 0:
+            ts_val = trend_series.iloc[-1]
+            trend_score = _to_float(ts_val) if np.isfinite(ts_val) else None
+
+        trend_category = _categorize_trend(trend_score)
 
         # Ensure "AdjClose" column naming is consistent
         if "AdjClose" in df:
@@ -579,6 +553,10 @@ def technicals(df: pd.DataFrame, cfg: ScannerConfig) -> Dict[str, Any]:
             "open_series": _to_1d_list(df["Open"].tail(260)),
             "high_series": _to_1d_list(df["High"].tail(260)),
             "low_series": _to_1d_list(df["Low"].tail(260)),
+
+            # sector analysis
+            "trend_score_26w": safe_round(trend_score, 3) if trend_score is not None else None,
+            "trend_category": trend_category,
         }
 
         # Final sanity logs to catch ndarray/DF leaks before returning
@@ -592,7 +570,10 @@ def technicals(df: pd.DataFrame, cfg: ScannerConfig) -> Dict[str, Any]:
         log.exception("technicals() failed")
         raise
 
-def analyze_ticker(ticker: str, cfg: ScannerConfig) -> Optional[Dict[str, Any]]:
+def analyze_ticker(
+    ticker: str,
+    cfg: Optional[ScannerConfig] = ScannerConfig
+) -> Optional[Dict[str, Any]]:
     cfg.current_ticker = ticker  # for logs inside technicals()
     log = get_log(ticker)
     log.info("Analyze ticker start")
@@ -629,6 +610,12 @@ def analyze_ticker(ticker: str, cfg: ScannerConfig) -> Optional[Dict[str, Any]]:
         alloc_cap = max_margin_dollars / max(1, cfg.max_open_margin_positions)
         shares_by_alloc = alloc_cap / entry_price
         shares_suggested = int(max(0, min(size_by_risk, shares_by_alloc)))
+
+        trend_category = tech.get("trend_category")
+        trend_score = tech.get("trend_score_26w")
+
+        log_value(log, "Sector Category", trend_category, level=logging.INFO)
+        log_value(log, "Sector Score", trend_score, level=logging.INFO)
 
         sn = get_news_and_sentiment(ticker)
         fn = get_fundamentals(ticker)
@@ -671,6 +658,41 @@ def analyze_ticker(ticker: str, cfg: ScannerConfig) -> Optional[Dict[str, Any]]:
         composite = _to_float(tech["signals_score"]) + sentiment_score + catalyst_score + fundamentals_score
         log_value(log, "composite", composite, level=logging.INFO)
 
+        # -- sector mix from ETF holdings (optional, only if you provide files) ------
+        sector_mix = {}
+        etf_category = None
+        etf_category_share = None
+        etf_category_hhi = None
+
+        etf_files = getattr(cfg, "sector_files", None)  # e.g., list of CSVs with ETF holdings
+        if etf_files:
+            try:
+                etfs_df = extract_all_etfs(etf_files)
+                sector_mix = sector_mix_for_ticker(etfs_df, ticker)
+                if sector_mix:
+                    # pick the largest share as "category"
+                    etf_category = max(sector_mix, key=sector_mix.get)
+                    stats = mix_concentration_stats(sector_mix)
+                    etf_category_share = float(stats["top_share"])     # 0..1 (how entrenched in top category)
+                    etf_category_hhi = float(stats["hhi"])             # 0..1 (overall concentration)
+            except Exception:
+                log.exception("Failed sector_mix_for_ticker")
+
+        # -- correlation-based behavioral affinity to sector ETFs ---------------------
+        sector_map = getattr(cfg, "sector_etf_map", DEFAULT_SECTOR_ETF_MAP)
+        sec_px = {}
+        for sec_name, sym in sector_map.items():
+            s = _cached_close_series(sym, start, end)
+            if s is not None and not s.empty:
+                sec_px[sec_name] = s
+
+        sector_prices = pd.DataFrame(sec_px) if sec_px else pd.DataFrame()
+        corr_info = sector_corr_affinity(df["Close"], sector_prices, lookback_wks=getattr(cfg, "trend_lookback_wks", 26))
+        corr_category = corr_info.get("best_sector")
+        corr_strength = corr_info.get("best_corr")
+        # You can persist the full map if you like (goes to CSV as a str):
+        corr_map = corr_info.get("corrs", {})
+
         structured = build_structured_record(
             ticker=ticker,
             entry_price=entry_price,
@@ -686,6 +708,14 @@ def analyze_ticker(ticker: str, cfg: ScannerConfig) -> Optional[Dict[str, Any]]:
             tech=tech,
             composite=composite,
             sentiment_val=sentiment_val,
+            trend_category=trend_category,
+            trend_score=trend_score,
+            etf_category=etf_category,
+            etf_category_share=etf_category_share,
+            etf_category_hhi=etf_category_hhi,
+            corr_category=corr_category,
+            corr_strength=corr_strength,
+            corr_map=corr_map,
         )
 
         flat = flatten_sections(structured, sep="__")
@@ -779,6 +809,7 @@ def run_scan(
 
         df.to_csv(out_csv, index=False)
         log.info("Wrote %s with %d candidates.", out_csv, len(df))
+        log(df)
         return df
 
     except Exception:

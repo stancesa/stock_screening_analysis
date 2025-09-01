@@ -1,7 +1,7 @@
 
 from src.config import ScannerConfig
 from src.scanner import run_scan
-from src.charts import export_analysis_to_excel
+from src.viz.charts import export_analysis_to_excel
 
 if __name__ == "__main__":
     cfg = ScannerConfig()
