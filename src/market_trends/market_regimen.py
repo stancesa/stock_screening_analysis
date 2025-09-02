@@ -113,17 +113,117 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Callable, Dict, Iterable, Optional, Tuple, List
+from typing import Callable, Dict, Iterable, Optional, Tuple, List, Any
 
 import numpy as np
 import pandas as pd
 
 import sys
 
-# Reuse your existing weekly trend scoring
-from .etf_sector_analysis import sector_trend_score
-# from core.utils import _to_scalar, _as_float
+try:
+    # optional; we guard if not installed
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.calibration import CalibratedClassifierCV
+    from sklearn.metrics import roc_auc_score, brier_score_loss
+    _SKLEARN_OK = True
+except Exception:
+    _SKLEARN_OK = False
 
+from .etf_sector_analysis import sector_trend_score
+
+
+# =========================== Machine Learning Tests =================================
+
+@dataclass
+class RegimeLearnerConfig:
+    """Controls the learned-headline (probability) model."""
+    enabled: bool = True                # turn on/off the learner
+    horizon_days: int = 20              # predict risk over next N trading days
+    dd_threshold: float = -0.05         # event = max drawdown <= -5%
+    ridge_C: float = 0.7                # regularization (smaller -> more shrinkage)
+    cv: int = 5                         # calibration folds
+    use_features: Tuple[str, ...] = (   # default driver set (category-level + a few primitives)
+        "equities","breadth","vol","rates_credit","fx","intl","commodities","reits","crypto","internals",
+        "vix_pctile_1y","breadth_pctile_1y","credit_above_200dma","dxy_trend","uup_trend"
+    )
+
+@dataclass
+class RegimeModel:
+    """Fitted model + metadata kept in-memory (or pickle on disk in your app)."""
+    model: Any
+    feature_names: List[str]
+    horizon_days: int
+    dd_threshold: float
+    metrics: Dict[str, float] | None = None  # brier, auc on validation (optional)
+
+# Headline selector (user sliders vs learned vs blend)
+@dataclass
+class HeadlineMode:
+    mode: str = "user"       # "user" | "learned" | "blend"
+    blend_alpha: float = 0.7 # fraction of LEARNED in the blend, e.g., 0.7 * learned + 0.3 * user
+
+# Overlap penalty between near-duplicate categories (to reduce double counting)
+OVERLAP_PAIRS = [
+    ("equities", "breadth"),
+    ("rates_credit", "reits"),
+]
+OVERLAP_STRENGTH = 0.20  # max 20% shrink when two categories are basically identical at t
+
+def _apply_overlap_penalty(weights: dict[str,float], cat_scores: dict[str,float|None]) -> dict[str,float]:
+    """Shrink weights when two categories are moving in lockstep (same-side, similar magnitude)."""
+    ws = {k: float(v) for k, v in weights.items()}
+    for a, b in OVERLAP_PAIRS:
+        sa = cat_scores.get(a); sb = cat_scores.get(b)
+        if isinstance(sa, (int,float)) and isinstance(sb, (int,float)):
+            # closeness 0..1 (identical -> 1, opposite -> 0)
+            closeness = 1.0 - min(abs(sa - sb) / 100.0, 1.0)
+            shrink = 1.0 - (OVERLAP_STRENGTH * closeness)
+            ws[a] *= shrink
+            ws[b] *= shrink
+    # renormalize to sum ~1
+    s = sum(max(0.0,v) for v in ws.values()) or 1.0
+    return {k: max(0.0,v)/s for k,v in ws.items()}
+
+def _contribs_from_scores(cat_scores: dict[str, float|None], weights: dict[str,float]) -> dict[str,float]:
+    """Contribution relative to neutral 50: weight * (score - 50)."""
+    out = {}
+    for k, w in weights.items():
+        v = cat_scores.get(k)
+        out[k] = (w * ((float(v) if v is not None else 50.0) - 50.0)) if w>0 else 0.0
+    return out
+
+def _agreement_percent(cat_scores: dict[str, float|None], thr_hi=55.0, thr_lo=45.0) -> float:
+    """Share of categories decisively on one side; mixed bins count as neutral."""
+    pos = sum(1 for v in cat_scores.values() if isinstance(v,(int,float)) and v>=thr_hi)
+    neg = sum(1 for v in cat_scores.values() if isinstance(v,(int,float)) and v<=thr_lo)
+    tot = sum(1 for v in cat_scores.values() if isinstance(v,(int,float)))
+    return 0.0 if tot==0 else 100.0 * max(pos,neg) / tot
+
+def _confidence_from_dispersion(cat_scores: dict[str,float|None]) -> float:
+    """High dispersion -> low confidence; low dispersion & strong agreement -> high."""
+    xs = [float(v) for v in cat_scores.values() if isinstance(v,(int,float))]
+    if not xs: return 50.0
+    disp = np.std(xs)
+    base = max(0.0, 100.0 - (disp * 1.1))  # 0..100, wider distribution -> smaller number
+    # small bump if strong consensus
+    return float(np.clip(base + 0.25 * _agreement_percent(cat_scores), 0, 100))
+
+def _regime_with_hysteresis(score_now: float, prev: Optional[float], up=5.0, down=3.0) -> str:
+    """Hysteresis around buckets to reduce flip-flops."""
+    # Base label thresholds
+    base = _regime_label(score_now)
+    if prev is None: 
+        return base
+    # Nudged thresholds around previous bucket
+    prev_lab = _regime_label(prev)
+    if prev_lab.startswith("Risk-On") and score_now >= 60.0 - down: return "Risk-On"
+    if prev_lab == "Neutral":
+        if score_now >= 60.0 + up: return "Risk-On"
+        if score_now <= 40.0 - down: return "Risk-Off"
+        return "Neutral"
+    if prev_lab == "Risk-Off" and score_now <= 40.0 + up: return "Risk-Off"
+    return base
+# ============================================================================ 
 
 # --------------------------- Registries -------------------------------------
 
@@ -591,6 +691,115 @@ def _weighted_avg(pairs: list[tuple[float | None, float]]) -> float | None:
         den += w
     return float(num / den) if den > 0 else None
 
+# --------------------------- Fit Model from Sampling --------------------------------------
+def _maxdd_next(px: pd.Series, horizon_days: int = 20) -> pd.Series:
+    """Vectorized next-window Max Drawdown in %, aligned to current date (no look-ahead leak at t)."""
+    # future rolling max and min from t+1..t+h
+    fwd = px.shift(-1).rolling(horizon_days, min_periods=2)
+    fmax = fwd.max()
+    fmin = fwd.min()
+    dd = (fmin / fmax - 1.0) * 100.0
+    return dd
+
+def _label_risk_event(px: pd.Series, horizon_days=20, dd_threshold=-5.0) -> pd.Series:
+    """1 if next-20d MaxDD <= -5%, else 0."""
+    dd = _maxdd_next(px, horizon_days=horizon_days)
+    return (dd <= (dd_threshold*100 if abs(dd_threshold)>1 else dd_threshold)).astype(float)
+
+def fit_regime_model_from_history(
+    cfg: MarketRegimenConfig,
+    fetch_fn: FetchFn,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    learner: RegimeLearnerConfig | None = None,
+) -> Optional[RegimeModel]:
+    """
+    Replays your own pipeline weekly to build {features -> label} without look-ahead,
+    then fits a calibrated ridge logistic regression. Returns a RegimeModel.
+    """
+    if not _SKLEARN_OK:
+        return None
+    learner = learner or RegimeLearnerConfig()
+
+    # 1) Collect data (weekly) and compute category scores without look-ahead
+    #    We sample on Fridays to keep runtime reasonable.
+    idx = pd.date_range(start, end, freq="W-FRI")
+    rows = []
+    last_prices = {}
+    last_extras = {}
+    for dt in idx:
+        try:
+            # fetch up to dt (inclusive)
+            res = build_market_regime_section(cfg, fetch_fn, start, dt, headline_mode=HeadlineMode("user"))
+            # Just store what we need (category scores + a few primitives)
+            cats = res.get("score_blocks") or {}
+            row = {k: float(v) if v is not None else np.nan for k, v in cats.items()}
+            # small set of primitives
+            for k in ("vix_pctile_1y","breadth_pctile_1y","credit_above_200dma","dxy_trend","uup_trend"):
+                val = res.get(k)
+                row[k] = float(val) if isinstance(val,(int,float,np.floating)) else np.nan
+            # spy close for labels
+            row["_spy_close"] = res.get("SPY_close") if "SPY_close" in res else np.nan
+            rows.append((dt, row))
+        except Exception:
+            continue
+    if not rows:
+        return None
+    Xdf = pd.DataFrame([r for _, r in rows], index=[t for t, _ in rows]).sort_index()
+
+    # 2) Get SPY closes for labels (use your fetcher to avoid data mismatch)
+    #    If SPY_close wasn't carried, refetch here:
+    if "_spy_close" not in Xdf.columns or Xdf["_spy_close"].isna().all():
+        spyd = _cached_close_series("SPY", start, end, fetch_fn)
+        if spyd is None: 
+            return None
+        Xdf["_spy_close"] = spyd.reindex(Xdf.index, method="ffill")
+    spy = Xdf["_spy_close"].dropna()
+    y = _label_risk_event(spy, horizon_days=learner.horizon_days, dd_threshold=learner.dd_threshold)
+    y = y.reindex(Xdf.index).dropna()
+    Xdf = Xdf.loc[y.index].drop(columns=["_spy_close"])
+
+    # 3) Clean features: fill NaNs (neutral 50 for category scores; 0 for primitives)
+    feats = []
+    feat_names: List[str] = []
+    for name in learner.use_features:
+        if name in Xdf.columns:
+            col = Xdf[name].copy()
+        elif name in ("equities","breadth","vol","rates_credit","fx","intl","commodities","reits","crypto","internals"):
+            # missing category -> neutral
+            col = pd.Series(50.0, index=Xdf.index)
+        else:
+            col = pd.Series(0.0, index=Xdf.index)
+        feats.append(col)
+        feat_names.append(name)
+    X = pd.concat(feats, axis=1)
+    # NaN policy
+    for c in X.columns:
+        if c in ("equities","breadth","vol","rates_credit","fx","intl","commodities","reits","crypto","internals"):
+            X[c] = X[c].fillna(50.0)
+        else:
+            X[c] = X[c].fillna(0.0)
+
+    # 4) Fit ridge logistic + probability calibration
+    base = LogisticRegression(penalty="l2", C=learner.ridge_C, max_iter=2000)
+    cal = CalibratedClassifierCV(base, method="isotonic", cv=learner.cv)
+    cal.fit(X.values, y.values)
+
+    # quick holdout-like metrics via CV predictions
+    try:
+        # Not perfect holdout, but useful: in-sample prob vs outcome
+        p = cal.predict_proba(X.values)[:,1]
+        metrics = {
+            "brier": float(brier_score_loss(y.values, p)),
+            "auc":   float(roc_auc_score(y.values, p)),
+        }
+    except Exception:
+        metrics = None
+
+    return RegimeModel(model=cal, feature_names=feat_names,
+                       horizon_days=learner.horizon_days,
+                       dd_threshold=learner.dd_threshold, metrics=metrics)
+
 # --------------------------- Pure core --------------------------------------
 def trend_scores_for(etf_map: dict[str, str], prices: pd.DataFrame, lookback_wks: int = 26) -> dict[str, float | None]:
     """
@@ -800,6 +1009,12 @@ def compute_market_regime_from_prices(
     prices = prices.copy()
     prices = _ensure_dtindex(prices, name="prices")
     prices.columns = [str(c).upper() for c in prices.columns]
+
+    if "SPY" in prices.columns:
+        try:
+            out["SPY_close"] = float(_to_scalar(prices["SPY"].iloc[-1]))
+        except Exception:
+            pass
 
     # Also coerce any extras/vix passed in
     if isinstance(vix, pd.Series) and not vix.empty:
@@ -1077,15 +1292,62 @@ def compute_market_regime_from_prices(
 
     # --- Category scores + Headline indicator
     try:
-        _cats = compute_category_scores(out)                 # dict per class
-        _combo = combine_category_scores(_cats, None)        # or pass custom weights
-        # Store both the compact scores and the full breakdown
-        out["score_blocks"] = {k: (v.get("score")) for k, v in _cats.items()}   # {class: score}
-        out["score_blocks_details"] = _cats                                        # with parts
-        out.update(_combo)  # adds headline_score_0_100 & headline_regime
-    except Exception:
+        # today
+        _cats_today = compute_category_scores(out)
+        # try to compute "yesterday" by truncating one row from all series (if possible)
+        prev_out = None
+        if isinstance(prices, pd.DataFrame) and len(prices) >= 2:
+            # shallow truncs
+            prices_prev = prices.iloc[:-1, :]
+            vix_prev = vix.iloc[:-1] if isinstance(vix, pd.Series) and len(vix) >= 2 else vix
+            extras_prev = {}
+            for k, s in extras.items():
+                if isinstance(s, pd.Series) and len(s) >= 2:
+                    extras_prev[k] = s.iloc[:-1]
+            prev_out = compute_market_regime_from_prices(
+                prices=prices_prev, vix=vix_prev,
+                lookback_wks=lookback_wks, risk_weights=risk_weights, extras=extras_prev
+            )
+            _cats_prev = compute_category_scores(prev_out)
+            prev_headline_raw = _as_float(prev_out.get("headline_score_0_100") or prev_out.get("headline_score_0_100_final"))
+        else:
+            _cats_prev, prev_headline_raw = None, None
+
+        # feed raw primitives too so the learner can use them
+        raw_feats = {k: v for k, v in out.items() if isinstance(v, (int, float, np.floating))}
+
+        # Select headline mode from caller context if present, else default user
+        _mode = raw_feats.get("_headline_mode_obj")  # optional injection by wrapper
+        if not isinstance(_mode, HeadlineMode):
+            _mode = HeadlineMode("user", 0.7)
+
+        _regime_model = raw_feats.get("_regime_model_obj")  # optional injection
+        if not isinstance(_regime_model, RegimeModel):
+            _regime_model = None
+
+        _combo = combine_category_scores_plus(
+            _cats_today,
+            None,  # use internal defaults; UI can still pass explicit weights upstream if needed
+            prev_cat_scores=_cats_prev,
+            prev_headline=prev_headline_raw,
+            mode=_mode,
+            regime_model=_regime_model,
+            raw_features=raw_feats,
+        )
+
+        # store compact & detailed
+        out["score_blocks"] = {k: (v.get("score")) for k, v in _cats_today.items()}
+        out["score_blocks_details"] = _cats_today
+        out.update(_combo)
+
+        # keep old key for backwards-compat with existing UI
+        if "headline_score_0_100" not in out:
+            out["headline_score_0_100"] = _combo["headline_score_0_100_final"]
+
+    except Exception as ex:
         # Fail-safe: keep regimen usable even if scoring hits an edge case
-        pass
+        out["headline_score_0_100"] = out.get("headline_score_0_100", 50.0)
+        out["headline_regime"] = out.get("headline_regime", "Neutral")
 
     return out
 # --------------------------- Fetch & build wrapper ---------------------------
@@ -1132,6 +1394,9 @@ def build_market_regime_section(
     fetch_fn: FetchFn,
     start: pd.Timestamp,
     end: pd.Timestamp,
+    *,
+    headline_mode: HeadlineMode | None = None,
+    regime_model: RegimeModel | None = None,
 ) -> Dict[str, object]:
     """
     Fetch data per config, compute regimen, and return a dict suitable for your
@@ -1394,6 +1659,107 @@ def combine_category_scores(
         "headline_weights": ws,
     }
 
+def combine_category_scores_plus(
+    cat_scores: dict[str, dict[str, object]],
+    user_weights: dict[str, float] | None,
+    *,
+    # optional yesterday for deltas/hysteresis
+    prev_cat_scores: dict[str, dict[str, object]] | None = None,
+    prev_headline: float | None = None,
+    # learned-headline
+    mode: HeadlineMode | None = None,
+    regime_model: RegimeModel | None = None,
+    raw_features: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """
+    Returns a rich dict: user_headline, learned_headline (if model), blended headline,
+    contributions, deltas, agreement %, confidence, final regime with hysteresis.
+    """
+    mode = mode or HeadlineMode("user", 0.7)
+    ws_user = (user_weights or CATEGORY_WEIGHTS_DEFAULT).copy()
+
+    # Extract simple {cat: score} 0..100
+    curr = {k: float(v.get("score")) for k, v in cat_scores.items() if isinstance(v.get("score"), (int, float))}
+    prev = None
+    if isinstance(prev_cat_scores, dict):
+        prev = {k: float(v.get("score")) for k, v in prev_cat_scores.items() if isinstance(v.get("score"), (int, float))}
+
+    # Apply overlap penalty, then compute user headline
+    ws_eff = _apply_overlap_penalty(ws_user, curr)
+    pairs = [(curr.get(k), w) for k, w in ws_eff.items()]
+    user_headline = _weighted_avg(pairs)
+    user_headline = float(np.clip(user_headline if user_headline is not None else 50.0, 0.0, 100.0))
+
+    # Contributions & deltas (relative to neutral 50 baseline)
+    contrib = _contribs_from_scores(curr, ws_eff)
+    delta = None
+    if prev is not None:
+        delta = {k: contrib.get(k,0.0) - _contribs_from_scores(prev, ws_eff).get(k,0.0) for k in ws_eff.keys()}
+
+    # Learned headline (probability of 20d drawdown); fallback if model missing
+    learned_prob = None
+    learned_headline = None
+    if regime_model and _SKLEARN_OK:
+        feats: list[float] = []
+        names = regime_model.feature_names
+        # priority: category scores first (same names)
+        for name in names:
+            if name in curr:
+                feats.append(float(curr[name]))
+            else:
+                feats.append(float(_as_float(raw_features.get(name)) if raw_features else np.nan))
+        X = np.array(feats, dtype=float).reshape(1, -1)
+        # nan-safe: replace NaN with 50 (neutral) for category scores, or 0 for metrics
+        for i, n in enumerate(names):
+            if not np.isfinite(X[0, i]):
+                X[0, i] = 50.0 if n in curr else 0.0
+        try:
+            p = regime_model.model.predict_proba(X)[:, 1][0]
+            learned_prob = float(p)  # event = high drawdown risk
+            learned_headline = float(np.clip(100.0 * (1.0 - learned_prob), 0.0, 100.0))
+        except Exception:
+            pass
+
+    # Choose final headline
+    if mode.mode == "learned" and learned_headline is not None:
+        final_headline = learned_headline
+    elif mode.mode == "blend" and learned_headline is not None:
+        a = float(np.clip(mode.blend_alpha, 0.0, 1.0))
+        final_headline = float(a * learned_headline + (1.0 - a) * user_headline)
+    else:
+        final_headline = user_headline
+
+    # Agreement & confidence; regime with hysteresis
+    agree = _agreement_percent(curr)
+    conf = _confidence_from_dispersion(curr)
+    regime = _regime_with_hysteresis(final_headline, prev_headline, up=5.0, down=3.0)
+
+    # Top drivers / drags for narrative
+    drivers_sorted = sorted(contrib.items(), key=lambda kv: kv[1], reverse=True)
+    top_pos = [k for k, v in drivers_sorted if v > 0][:3]
+    top_neg = [k for k, v in sorted(contrib.items(), key=lambda kv: kv[1]) if v < 0][:3]
+
+    # Plain-English blurb
+    msg = f"{regime} ({final_headline:.0f}). Pos: {', '.join(top_pos) or '—'}. Neg: {', '.join(top_neg) or '—'}."
+    if learned_prob is not None:
+        msg += f" 20d drawdown risk ≈ {100.0*learned_prob:.1f}%."
+
+    return {
+        # keep original outputs compatible
+        "headline_score_0_100_user": user_headline,
+        "headline_score_0_100_learned": learned_headline,
+        "headline_score_0_100_final": final_headline,
+        "headline_regime": regime,
+        "headline_confidence_0_100": conf,
+        "headline_agreement_pct": agree,
+        "headline_weights_effective": ws_eff,
+
+        "contributions_from_neutral": contrib,  # weight*(score-50)
+        "contributions_delta_since_yday": delta,
+
+        "headline_summary": msg,
+        "learned_drawdown_prob_20d": learned_prob,
+    }
 
 if __name__ == "__main__":
     import argparse, json, traceback, datetime as _dt, logging

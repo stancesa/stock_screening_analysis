@@ -48,6 +48,14 @@ from market_trends.market_regimen import (
     combine_category_scores    # fallback combiner
 )
 from market_trends.components import CATEGORY_LABELS, CATEGORY_HELP, CATEGORY_ORDER
+from market_trends.market_regimen import (
+    MarketRegimenConfig,
+    build_market_regime_section,
+    HeadlineMode,
+    RegimeLearnerConfig,
+    RegimeModel,
+    fit_regime_model_from_history,
+)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # App bootstrap
@@ -776,8 +784,91 @@ def _fmt_pct(x, nd=1):
 
 def _fmt_float(x, nd=2):
     return "" if x is None else f"{x:.{nd}f}"
+def render_market_regime_backtest(fetch_fn):
+    st.markdown("### 📈 Backtest & Calibration")
 
-def render_market_sentiment_dashboard(mr: dict):
+    col1, col2, col3 = st.columns([1,1,1])
+    with col1:
+        start_bt = st.date_input("Backtest start", dt.date(2015,1,1))
+    with col2:
+        end_bt = st.date_input("Backtest end", dt.date.today())
+    with col3:
+        thr = st.slider("Risk threshold (enter market if risk < τ)", 0.0, 1.0, 0.25, 0.01)
+
+    cfg = MarketRegimenConfig()
+    model = _fit_regime_model_cached(cfg, fetch_fn, str(start_bt), str(end_bt))
+    if model is None:
+        st.warning("Model not available—fit failed or scikit-learn not installed.")
+        return
+
+    # Replay weekly, get p(default) and realized outcomes
+    idx = pd.date_range(start_bt, end_bt, freq="W-FRI")
+    rows = []
+    closes = []
+    for t in idx:
+        res = build_market_regime_section(
+            cfg, fetch_fn, start=pd.to_datetime(start_bt), end=pd.to_datetime(t),
+            headline_mode=HeadlineMode("learned"), regime_model=model
+        )
+        p = res.get("learned_drawdown_prob_20d")
+        rows.append({"date": t, "p": float(p) if p is not None else np.nan})
+        closes.append(res.get("SPY_close"))
+    df = pd.DataFrame(rows).set_index("date")
+    spy = pd.Series(closes, index=df.index).ffill().dropna()
+    # Realized next-20d MaxDD label (same as training definition)
+    def _maxdd_next(px: pd.Series, h=20):
+        fwd = px.shift(-1).rolling(h, min_periods=2)
+        return (fwd.min() / fwd.max() - 1.0) * 100.0
+    realized_dd = _maxdd_next(spy, 20)
+    df = df.join(realized_dd.rename("dd")).dropna()
+    df["event"] = (df["dd"] <= -5.0).astype(int)  # 1 if bad drawdown
+
+    # Calibration (reliability)
+    bins = pd.qcut(df["p"].clip(0,1), q=10, duplicates="drop")
+    cal = df.groupby(bins).agg(p_hat=("p","mean"), event_rate=("event","mean"))
+    cal_fig = go.Figure()
+    cal_fig.add_scatter(x=cal["p_hat"], y=cal["event_rate"], mode="lines+markers", name="Observed")
+    cal_fig.add_scatter(x=[0,1], y=[0,1], mode="lines", name="Perfect", line=dict(dash="dash"))
+    cal_fig.update_layout(title="Calibration (10 bins)", xaxis_title="Predicted probability", yaxis_title="Observed frequency",
+                          height=380, margin=dict(l=10,r=10,t=40,b=10))
+    st.plotly_chart(cal_fig, use_container_width=True)
+
+    # Decile lift (event rate / base rate)
+    base = df["event"].mean()
+    lift = (cal["event_rate"] / max(base, 1e-9)).rename("lift").reset_index(drop=True)
+    lift_fig = go.Figure(go.Bar(x=list(range(1, len(lift)+1)), y=lift))
+    lift_fig.update_layout(title=f"Decile Lift (base rate {base:.1%})", xaxis_title="Decile (low→high risk)",
+                           yaxis_title="Lift vs base", height=340, margin=dict(l=10,r=10,t=40,b=10))
+    st.plotly_chart(lift_fig, use_container_width=True)
+
+    # Simple strategy test (weekly signals)
+    p = df["p"].clip(0,1)
+    in_mkt = (p < thr).astype(int)
+    ret = spy.pct_change().fillna(0)
+    # hold for a week from signal; approx by multiplying by in_mkt shifted (enter next bar)
+    strat = (in_mkt.shift(1).fillna(0) * ret).add(0.0)
+    eq_curve = (1.0 + strat).cumprod()
+    eq_spy   = (1.0 + ret).cumprod()
+
+    perf_fig = go.Figure()
+    perf_fig.add_scatter(x=eq_curve.index, y=eq_curve, name="Strategy")
+    perf_fig.add_scatter(x=eq_spy.index, y=eq_spy,   name="Buy & Hold", line=dict(dash="dash"))
+    perf_fig.update_layout(title=f"Strategy vs SPY (τ={thr:.2f})", yaxis_title="Growth of $1",
+                           height=380, margin=dict(l=10,r=10,t=40,b=10))
+    st.plotly_chart(perf_fig, use_container_width=True)
+
+    colm1, colm2, colm3 = st.columns(3)
+    with colm1:
+        st.metric("CAGR (strategy)", f"{(eq_curve.iloc[-1]**(52/len(eq_curve))-1):.2%}")
+    with colm2:
+        st.metric("CAGR (SPY)", f"{(eq_spy.iloc[-1]**(52/len(eq_spy))-1):.2%}")
+    with colm3:
+        dd_strat = (eq_curve/eq_curve.cummax()-1).min()
+        dd_spy   = (eq_spy/eq_spy.cummax()-1).min()
+        st.metric("MaxDD (strategy)", f"{dd_strat:.2%}")
+        st.caption(f"MaxDD (SPY): {dd_spy:.2%}")
+
+def render_market_sentiment_dashboard(mr: dict, *, show_header: bool = True, show_legacy_headline: bool = False):
     """
     Beautiful per-category sentiment + interactive weights → recomputed headline.
     Expects mr to contain:
@@ -785,6 +876,8 @@ def render_market_sentiment_dashboard(mr: dict):
       - 'score_blocks_details': {category: {'parts': {...}}}
       - 'headline_score_0_100', 'headline_regime'   (optional; we recompute anyway)
     """
+    if show_header:
+        st.markdown("### 🌐 Market Sentiment Dashboard")
     # Fallback: if score_blocks missing, compute from raw features
     if not mr.get("score_blocks"):
         try:
@@ -813,138 +906,139 @@ def render_market_sentiment_dashboard(mr: dict):
     # ——— Top: headline gauge (from adjustable weights) ———
     c_top1, c_top2 = st.columns([1.3, 1])
     with c_top1:
-        # ── Callouts (top): strongest / weakest / dispersion ──────────────────────
+        # ── KPI callouts ────────────────────────────────────────────────
         try:
             theta = cat_order
             rvals = [float(scores.get(k) or 0.0) for k in theta]
 
-            # Normalized weights (from session) for both the radar and treemap
-            w_raw  = st.session_state.get(
-                "mr_weights", {k: CATEGORY_WEIGHTS_DEFAULT.get(k, 0.1) for k in theta}
-            )
-            w_norm = _norm_weights(w_raw)             # sums to 1.0
-            wvals  = [w_norm.get(k, 0.0) * 100.0 for k in theta]  # ×100 only for the ring
+            w_raw  = st.session_state.get("mr_weights", {k: CATEGORY_WEIGHTS_DEFAULT.get(k, 0.1) for k in theta})
+            w_norm = _norm_weights(w_raw)                   # sums to 1.0
+            wvals  = [w_norm.get(k, 0.0) * 100.0 for k in theta]  # ×100 only for ring
 
-            # Callouts
             pairs = [(k, float(scores.get(k) or float("nan"))) for k in theta]
             pairs = [p for p in pairs if np.isfinite(p[1])]
             if pairs:
                 top_cat, top_val = max(pairs, key=lambda p: p[1])
                 bot_cat, bot_val = min(pairs, key=lambda p: p[1])
-                disp = float(np.nanstd([v for _, v in pairs]))  # cross-category dispersion
+                disp = float(np.nanstd([v for _, v in pairs]))
 
                 palette = _category_palette()
                 chips = [
-                    (
-                        "Strongest",
-                        f"{top_cat.title()} {top_val:.1f}",
-                        palette.get(top_cat, "#16a34a"),
-                        "🏆",
-                        {"html": _parts_tooltip_html(top_cat, (details.get(top_cat) or {}).get("parts")),
-                        "max_width": 460},
-                    ),
-                    (
-                        "Weakest",
-                        f"{bot_cat.title()} {bot_val:.1f}",
-                        palette.get(bot_cat, "#ef4444"),
-                        "⚠️",
-                        {"html": _parts_tooltip_html(bot_cat, (details.get(bot_cat) or {}).get("parts")),
-                        "max_width": 460},
-                    ),
+                    ("Strongest", f"{top_cat.title()} {top_val:.1f}", palette.get(top_cat, "#16a34a"), "🏆",
+                    {"html": _parts_tooltip_html(top_cat, (details.get(top_cat) or {}).get("parts")), "max_width": 460}),
+                    ("Weakest",   f"{bot_cat.title()} {bot_val:.1f}", palette.get(bot_cat, "#ef4444"), "⚠️",
+                    {"html": _parts_tooltip_html(bot_cat, (details.get(bot_cat) or {}).get("parts")), "max_width": 460}),
                     ("Dispersion σ", f"{disp:.1f}", "#64748b", "📐"),
                 ]
                 kpi_row(chips, scale=1.05)
         except Exception:
             pass
 
-        # ── Radar (middle) — your upgraded version ────────────────────────────────
-        try:
-            # (reuse theta, rvals, w_norm, wvals from above)
-            point_colors = [_category_palette().get(k, "#22c55e") for k in theta]
-            tmpl  = get_settings()["chart"].get("template", "plotly_white")
-            dark  = _is_dark_theme()
-            txt   = "#e5e7eb" if dark else "#0f172a"
-            grid  = "rgba(255,255,255,.18)" if dark else "rgba(0,0,0,.15)"
-            accent = th.get("overlay", "#22c55e")
-            r,g,b = _hex_to_rgb(accent)
+        # ── Radar (left) + Gauge (right) on the same row ───────────────────────────
+        left, right = st.columns([1.35, 1])   # tweak ratio to taste
+        with left:
+            try:
+                point_colors = [_category_palette().get(k, "#22c55e") for k in theta]
+                tmpl  = get_settings()["chart"].get("template", "plotly_white")
+                dark  = _is_dark_theme()
+                txt   = "#e5e7eb" if dark else "#0f172a"
+                grid  = "rgba(255,255,255,.18)" if dark else "rgba(0,0,0,.15)"
+                accent = th.get("overlay", "#22c55e")
+                r,g,b = _hex_to_rgb(accent)
 
-            fig_radar = go.Figure()
-            fig_radar.add_trace(go.Scatterpolar(
-                r=wvals + wvals[:1], theta=theta + theta[:1],
-                mode="lines",
-                line=dict(color="rgba(71,85,105,0.75)" if not dark else "rgba(148,163,184,0.85)", dash="dot", width=2),
-                hovertemplate="<b>%{theta}</b><br>Weight: %{r:.1f} (×100)<extra>Weights</extra>",
-                name="Weights (×100)"
-            ))
-            fig_radar.add_trace(go.Scatterpolar(
-                r=rvals + rvals[:1], theta=theta + theta[:1],
-                mode="lines", fill="toself",
-                line=dict(color=accent, width=3),
-                fillcolor=f"rgba({r},{g},{b},0.20)",
-                hovertemplate="<b>%{theta}</b><br>Score: %{r:.1f}<extra>Score</extra>",
-                name="Category score"
-            ))
-            fig_radar.add_trace(go.Scatterpolar(
-                r=rvals, theta=theta, mode="markers",
-                marker=dict(size=9, color=point_colors, line=dict(width=1, color="white")),
-                customdata=[w_norm.get(k, 0.0) * 100.0 for k in theta],
-                hovertemplate="<b>%{theta}</b><br>Score: %{r:.1f}<br>Weight: %{customdata:.1f} (×100)<extra></extra>",
-                name="", showlegend=False
-            ))
-            fig_radar.update_layout(
-                template=tmpl,
-                height=300,  # slightly shorter to make room for treemap below
-                margin=dict(l=8, r=8, t=10, b=8),
-                paper_bgcolor="rgba(0,0,0,0)",
-                font=dict(color=txt),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-                polar=dict(
-                    bgcolor="rgba(0,0,0,0)",
-                    radialaxis=dict(
-                        range=[0, 100], tickvals=[0, 25, 50, 75, 100],
-                        gridcolor=grid, gridwidth=1, tickfont=dict(size=11)
+                fig_radar = go.Figure()
+                fig_radar.add_trace(go.Scatterpolar(
+                    r=wvals + wvals[:1], theta=theta + theta[:1],
+                    mode="lines",
+                    line=dict(color="rgba(71,85,105,0.75)" if not dark else "rgba(148,163,184,0.85)", dash="dot", width=2),
+                    hovertemplate="<b>%{theta}</b><br>Weight: %{r:.1f} (×100)<extra>Weights</extra>",
+                    name="Weights (×100)"
+                ))
+                fig_radar.add_trace(go.Scatterpolar(
+                    r=rvals + rvals[:1], theta=theta + theta[:1],
+                    mode="lines", fill="toself",
+                    line=dict(color=accent, width=3),
+                    fillcolor=f"rgba({r},{g},{b},0.20)",
+                    hovertemplate="<b>%{theta}</b><br>Score: %{r:.1f}<extra>Score</extra>",
+                    name="Category score"
+                ))
+                fig_radar.add_trace(go.Scatterpolar(
+                    r=rvals, theta=theta, mode="markers",
+                    marker=dict(size=9, color=point_colors, line=dict(width=1, color="white")),
+                    customdata=[w_norm.get(k, 0.0) * 100.0 for k in theta],
+                    hovertemplate="<b>%{theta}</b><br>Score: %{r:.1f}<br>Weight: %{customdata:.1f} (×100)<extra></extra>",
+                    name="", showlegend=False
+                ))
+                fig_radar.update_layout(
+                    template=tmpl,
+                    height=300,
+                    margin=dict(l=8, r=8, t=10, b=8),
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color=txt),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                    polar=dict(
+                        bgcolor="rgba(0,0,0,0)",
+                        radialaxis=dict(range=[0,100], tickvals=[0,25,50,75,100], gridcolor=grid, gridwidth=1, tickfont=dict(size=11)),
+                        angularaxis=dict(gridcolor=grid, linecolor=grid, tickfont=dict(size=12), direction="clockwise", rotation=90),
                     ),
-                    angularaxis=dict(
-                        gridcolor=grid, linecolor=grid, tickfont=dict(size=12),
-                        direction="clockwise", rotation=90
-                    ),
+                    showlegend=True,
+                )
+                st.plotly_chart(fig_radar, use_container_width=True)
+            except Exception:
+                st.caption("Radar unavailable for current data.")
+
+        with right:
+            # Compute headline right here so the gauge lives next to the radar
+            weights_norm = _norm_weights(st.session_state.get("mr_weights", w_raw))
+            headline = float(mr.get("headline_score_0_100_final") or _weighted_headline_from(scores, weights_norm))
+            lbl      = (mr.get("headline_regime") or _headline_label(headline))
+
+            fig_g = go.Figure(go.Indicator(
+                mode="gauge+number",
+                value=headline,
+                number=dict(suffix=""),
+                title={"text": f"{lbl}"},
+                gauge=dict(
+                    axis=dict(range=[0,100]),
+                    steps=[
+                        {"range":[0,30],  "color":"#16a34a"},
+                        {"range":[30,60], "color":"#84cc16"},
+                        {"range":[60,80], "color":"#f59e0b"},
+                        {"range":[80,100],"color":"#ef4444"},
+                    ],
+                    bar=dict(thickness=0.25),
                 ),
-                showlegend=True,
+            ))
+            fig_g.update_layout(
+                height=300,  # match radar height for visual alignment
+                margin=dict(l=8, r=8, t=28, b=8),
+                template=get_settings()["chart"].get("template","plotly_white"),
+                paper_bgcolor="rgba(0,0,0,0)",
             )
-            st.plotly_chart(fig_radar, use_container_width=True)
-        except Exception:
-            st.caption("Radar unavailable for current data.")
+            st.plotly_chart(fig_g, use_container_width=True)
 
-        # ── Weights vs. Scores treemap (bottom) — fills leftover space ────────────
+        # ── Treemap full width below ────────────────────────────────────────────────
         try:
             labels  = theta
             parents = ["Market"] * len(labels)
-            values  = [w_norm.get(k, 0.0) * 100.0 for k in labels]               # tile size = weight (%)
-            colors  = [float(scores.get(k) or 0.0) for k in labels]               # tile color = score
+            values  = [w_norm.get(k, 0.0) * 100.0 for k in labels]  # tile size = weight (%)
+            colors  = [float(scores.get(k) or 0.0) for k in labels]  # tile color = score
 
-            # Map 0→green .. 100→deep red to align with your gauge palette
             cs = [
-                [0.00,  "#16a34a"],
-                [0.30,  "#84cc16"],
-                [0.60,  "#f59e0b"],
-                [0.80,  "#ef4444"],
-                [1.00,  "#7f1d1d"],
+                [0.00, "#16a34a"], [0.30, "#84cc16"], [0.60, "#f59e0b"], [0.80, "#ef4444"], [1.00, "#7f1d1d"],
             ]
 
             fig_tree = go.Figure(go.Treemap(
-                labels=labels,
-                parents=parents,
-                values=values,
+                labels=labels, parents=parents, values=values,
                 marker=dict(colors=colors, colorscale=cs, cmin=0, cmax=100),
-                branchvalues="total",
-                pathbar=dict(visible=False),
+                branchvalues="total", pathbar=dict(visible=False),
                 texttemplate="<b>%{label}</b><br>%{value:.1f}% • %{color:.1f}",
                 hovertemplate="<b>%{label}</b><br>Weight: %{value:.1f}%<br>Score: %{color:.1f}<extra></extra>",
             ))
             fig_tree.update_layout(
-                height=240,
-                margin=dict(l=4, r=4, t=4, b=4),
+                height=240, margin=dict(l=4, r=4, t=4, b=4),
                 template=get_settings()["chart"].get("template", "plotly_white"),
+                paper_bgcolor="rgba(0,0,0,0)",
             )
             st.plotly_chart(fig_tree, use_container_width=True)
         except Exception:
@@ -955,7 +1049,23 @@ def render_market_sentiment_dashboard(mr: dict):
         with st.expander("Adjust category weights", expanded=True):
             new_w = {}
             for k in cat_order:
-                new_w[k] = st.slider(f"{k}", 0.0, 1.0, float(st.session_state["mr_weights"].get(k, CATEGORY_WEIGHTS_DEFAULT.get(k, 0.0))), 0.01)
+                label = CATEGORY_LABELS.get(k, k.title())
+                # Prefer a specific category help if present, else a sensible fallback
+                help_txt = (
+                    globals().get("CATEGORY_HELP", {}).get(k)       # preferred per-category help
+                    or globals().get("HELP", {}).get(k)             # legacy per-control help (if defined)
+                    or (
+                        f"Weight of {label}. 0 = ignore, 1 = strongest influence. "
+                        "Final weights are normalized to sum to 1."
+                    )
+                )
+                new_w[k] = st.slider(
+                    label,
+                    0.0, 1.0,
+                    float(st.session_state['mr_weights'].get(k, CATEGORY_WEIGHTS_DEFAULT.get(k, 0.0))),
+                    0.01,
+                    help=help_txt,   # ← this adds the tooltip “?”
+                )
             if st.button("Reset weights to defaults"):
                 st.session_state["mr_weights"] = {k: CATEGORY_WEIGHTS_DEFAULT.get(k, 0.1) for k in cat_order}
             else:
@@ -964,31 +1074,27 @@ def render_market_sentiment_dashboard(mr: dict):
         weights_norm = _norm_weights(st.session_state["mr_weights"])
         headline = _weighted_headline_from(scores, weights_norm)
         lbl = _headline_label(headline)
-
-        # Gauge
-        fig_g = go.Figure(go.Indicator(
-            mode="gauge+number",
-            value=headline,
-            number=dict(suffix=""),
-            title={"text": f"{lbl}"},
-            gauge=dict(
-                axis=dict(range=[0,100]),
-                steps=[
-                    {"range":[0,30], "color":"#16a34a"},
-                    {"range":[30,60], "color":"#84cc16"},
-                    {"range":[60,80], "color":"#f59e0b"},
-                    {"range":[80,100],"color":"#ef4444"},
-                ],
-                bar=dict(thickness=0.25)
-            )
-        ))
-        fig_g.update_layout(height=220, margin=dict(l=10,r=10,t=40,b=10),
-                            template=get_settings()["chart"].get("template","plotly_white"))
-        st.plotly_chart(fig_g, use_container_width=True)
-        # Show the normalized weights table
-        wdf = pd.DataFrame({"Category": list(weights_norm.keys()), "Weight": list(weights_norm.values())})
-        wdf["Weight"] = wdf["Weight"].map(lambda x: f"{x*100:.1f}%")
-        st.dataframe(wdf, hide_index=True, use_container_width=True)
+        if show_legacy_headline:
+            # Gauge
+            fig_g = go.Figure(go.Indicator(
+                mode="gauge+number",
+                value=headline,
+                number=dict(suffix=""),
+                title={"text": f"{lbl}"},
+                gauge=dict(
+                    axis=dict(range=[0,100]),
+                    steps=[
+                        {"range":[0,30], "color":"#16a34a"},
+                        {"range":[30,60], "color":"#84cc16"},
+                        {"range":[60,80], "color":"#f59e0b"},
+                        {"range":[80,100],"color":"#ef4444"},
+                    ],
+                    bar=dict(thickness=0.25)
+                )
+            ))
+            fig_g.update_layout(height=220, margin=dict(l=10,r=10,t=40,b=10),
+                                template=get_settings()["chart"].get("template","plotly_white"))
+            st.plotly_chart(fig_g, use_container_width=True)
 
     # ——— Middle: category chips with tooltips ———
     st.markdown("#### Category scores")
@@ -1016,6 +1122,147 @@ def render_market_sentiment_dashboard(mr: dict):
 
     # Derived, for convenience elsewhere in the page
     st.session_state["mr_headline_custom"] = {"score": headline, "label": lbl, "weights": weights_norm}
+
+# NEW: controller that computes/plots the learned/blend headline, then hands off to your renderer
+def render_market_sentiment_page(fetch_fn):
+    st.markdown("### 🌍 Market Sentiment Dashboard")
+
+    # -------- Controls (left) --------
+    with st.expander("Adjust category weights & headline mode", expanded=True):
+        colA, colB, colC = st.columns([1,1,1])
+        with colA:
+            mode_choice = st.radio(
+                "Headline mode",
+                options=["Blend (model + user)", "Learned (model only)", "User (sliders)"],
+                index=0,
+                horizontal=False,
+                help="Blend respects the model while honoring your sliders.",
+            )
+        with colB:
+            blend_alpha = st.slider("Blend: weight on model", 0.0, 1.0, 0.70, 0.05,
+                                    help="0 = only sliders, 1 = only model")
+        with colC:
+            start_hist = st.date_input("Training start", dt.date(2015,1,1))
+            end_hist   = st.date_input("Training end", dt.date.today())
+            refit = st.button("Refit model", type="secondary")
+
+        mode_map = {
+            "Blend (model + user)": ("blend", blend_alpha),
+            "Learned (model only)": ("learned", 1.0),
+            "User (sliders)":       ("user", 0.0),
+        }
+        _mode, _alpha = mode_map[mode_choice]
+        headline_mode = HeadlineMode(mode=_mode, blend_alpha=_alpha)
+
+    # -------- Fit / get model --------
+    model = _fit_regime_model_cached(
+        cfg=MarketRegimenConfig(),
+        fetch_fn=fetch_fn,
+        start_date=str(start_hist),
+        end_date=str(end_hist),
+    )
+    if refit:
+        _fit_regime_model_cached.clear()
+        model = _fit_regime_model_cached(
+            cfg=MarketRegimenConfig(), fetch_fn=fetch_fn,
+            start_date=str(start_hist), end_date=str(end_hist)
+        )
+
+    # -------- Compute today's regime --------
+    cfg = MarketRegimenConfig()
+    res = build_market_regime_section(
+        cfg=cfg,
+        fetch_fn=fetch_fn,
+        start=pd.to_datetime(dt.date.today() - dt.timedelta(days=370)),
+        end=pd.to_datetime(dt.date.today()),
+        headline_mode=headline_mode,
+        regime_model=model,
+    )
+
+    # ------------- TOP STRIP (your pasted UI) -------------
+    top1, top2, top3 = st.columns([1.2, 1, 1])
+
+    def _gauge(score: float, conf: float, title: str):
+        score = float(score or 50.0)
+        conf  = float(conf or 50.0)
+        fig = go.Figure(go.Indicator(
+            mode="gauge+number",
+            value=score,
+            number={"suffix": "", "font": {"size": 36}},
+            title={"text": title, "font": {"size": 14}},
+            gauge={
+                "axis": {"range": [0,100]},
+                "bar": {"thickness": 0.25},
+                "steps": [
+                    {"range": [0,40], "color": "rgba(220,70,70,0.35)"},
+                    {"range": [40,60], "color": "rgba(255,195,0,0.25)"},
+                    {"range": [60,75], "color": "rgba(100,200,100,0.30)"},
+                    {"range": [75,100], "color": "rgba(60,180,90,0.35)"},
+                ],
+                "threshold": {"line": {"width": 0}, "thickness": 0.95, "value": 100}
+            }
+        ))
+        fig.add_annotation(
+            x=0.5, y=0.15, xref="paper", yref="paper",
+            text=f"Confidence: {conf:.0f}%",
+            showarrow=False, font={"size": 12}
+        )
+        fig.update_layout(margin=dict(l=10,r=10,t=40,b=0), height=220)
+        return fig
+
+    with top1:
+        st.plotly_chart(_gauge(res.get("headline_score_0_100_final", 50.0),
+                               res.get("headline_confidence_0_100", 50.0),
+                               res.get("headline_regime","Neutral")), use_container_width=True)
+        st.caption(res.get("headline_summary",""))
+
+    with top2:
+        st.metric("Agreement (categories in consensus)",
+                  f"{res.get('headline_agreement_pct',0):.0f}%")
+        st.metric("Learned 20-day drawdown risk",
+                  f"{(res.get('learned_drawdown_prob_20d') or 0)*100:.1f}%",
+                  help="Calibrated probability that SPY suffers a ≤−5% max drawdown in the next ~20 trading days.")
+        _m = st.session_state.get("_mr_model_metrics") or (getattr(model, "metrics", None) if model else None)
+        if _m:
+            st.caption(f"Model (Brier {_m.get('brier',np.nan):.3f} • AUC {_m.get('auc',np.nan):.3f})")
+
+    with top3:
+        st.write("**Mode:**", mode_choice)
+        st.progress(int(res.get("headline_confidence_0_100", 0)))
+        st.caption("Higher is more internally consistent/less noisy signals.")
+
+    # ------------- DRIVERS -------------
+    st.markdown("#### Top drivers")
+    contrib = res.get("contributions_from_neutral", {}) or {}
+    if contrib:
+        cdf = (pd.Series(contrib)
+               .rename_axis("category")
+               .reset_index(name="contribution"))
+        cdf["side"] = np.where(cdf["contribution"]>=0, "Positive", "Negative")
+        cdf = cdf.sort_values("contribution", ascending=True)
+
+        fig = go.Figure()
+        fig.add_bar(
+            x=cdf["contribution"], y=cdf["category"],
+            orientation="h", hovertemplate="%{y}: %{x:.2f}<extra></extra>",
+        )
+        fig.update_layout(
+            height=350, margin=dict(l=10,r=10,t=10,b=10),
+            xaxis_title="Weighted contribution vs neutral (50)",
+            yaxis_title=None
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    deltas = res.get("contributions_delta_since_yday")
+    if isinstance(deltas, dict):
+        st.caption("Δ since yesterday (what changed): " +
+                   ", ".join(f"{k} {v:+.2f}" for k,v in sorted(deltas.items(), key=lambda kv: abs(kv[1]), reverse=True)[:5]))
+
+    # ------------- HAND OFF to your existing renderer -------------
+    # It draws the radar/treemap/sliders and bars using mr['score_blocks'].
+    # We pass the enriched dict so it can also read headline_summary etc if you choose.
+    render_market_sentiment_dashboard(res, show_header=False, show_legacy_headline=False)
+
 
 def _read_any_table(uploaded_file: Optional[io.BytesIO], path_text: str, prefer_output: bool) -> tuple[pd.DataFrame, str, Optional[Tuple[List[str], str]]]:
     """
@@ -1252,11 +1499,14 @@ def pick_row_and_series(df_view: pd.DataFrame, cols: dict):
         st.info("No rows match the current filters.")
         st.stop()
 
-    # Row selection
+    # Row selection (read the canonical selection; do NOT create another selectbox)
     if cols["ticker"]:
         tickers = df_view[cols["ticker"]].astype(str).tolist()
-        sel_ticker = st.selectbox("Select ticker", tickers, index=0 if tickers else None)
-        row = df_view[df_view[cols["ticker"]].astype(str) == sel_ticker].iloc[0]
+        sel = st.session_state.get("sel_ticker")
+        if not sel or sel not in tickers:
+            sel = tickers[0] if tickers else None
+            st.session_state["sel_ticker"] = sel
+        row = df_view[df_view[cols["ticker"]].astype(str) == sel].iloc[0]
     else:
         row = df_view.iloc[0]
 
@@ -1268,7 +1518,7 @@ def pick_row_and_series(df_view: pd.DataFrame, cols: dict):
         st.warning("Selected row has empty or invalid series.")
         st.stop()
 
-    # Table columns picker (for Review tab)
+    # Table columns picker
     default_cols = [c for c in ["Reco", cols["ticker"], cols.get("comp_norm"), cols.get("sig_norm"),
                                 cols["rsi"], cols["last"], cols["date"]]
                     if c and (c == "Reco" or c in df_view.columns)]
@@ -1402,6 +1652,27 @@ def render_weight_sliders(defaults: dict[str,float]) -> dict[str,float]:
         st.session_state["headline_weights"] = normed
         return normed
 
+@st.cache_resource(show_spinner=False)
+def _fit_regime_model_cached(cfg: MarketRegimenConfig, fetch_fn, start_date: str, end_date: str) -> RegimeModel | None:
+    try:
+        learner = RegimeLearnerConfig(
+            enabled=True,
+            horizon_days=20,
+            dd_threshold=-0.05,  # next-20d MaxDD ≤ -5% event
+            ridge_C=0.7,
+            cv=5,
+        )
+        model = fit_regime_model_from_history(
+            cfg=cfg,
+            fetch_fn=fetch_fn,
+            start=pd.to_datetime(start_date),
+            end=pd.to_datetime(end_date),
+            learner=learner,
+        )
+        return model
+    except Exception:
+        return None
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Data source & load (shared across tabs)
 # ────────────────────────────────────────────────────────────────────────────────
@@ -1450,11 +1721,25 @@ def _get_market_regime_cached() -> dict:
     raw = build_market_regime_section(cfg, fetch_history, start, end)
     return _sanitize_dict(raw)
 
+# After df_view is built:
+tickers = df_view[cols["ticker"]].astype(str).tolist() if cols["ticker"] else []
+_default = tickers[0] if tickers else None
+
+# canonical selection used by the app
+shared = st.session_state.get("sel_ticker", _default)
+if shared not in tickers:
+    shared = _default
+st.session_state["sel_ticker"] = shared
+
+# seed per-tab widget state so both dropdowns show the same selection
+st.session_state.setdefault("sel_ticker_review", shared)
+st.session_state.setdefault("sel_ticker_backtest", shared)
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Tabs
 # ────────────────────────────────────────────────────────────────────────────────
-tab_market, tab_review, tab_signals, tab_backtest, tab_settings, tab_profiles = st.tabs(
-    ["🌐 Market Sentiment", "📊 Review", "🧠 Signals", "🧪 Backtest", "⚙️ Settings", "💾 Profiles"]
+tab_market, tab_review, tab_backtest, tab_settings, tab_profiles = st.tabs(
+    ["🌐 Market Sentiment", "📊 Review", "🧠 Backtest", "⚙️ Settings", "💾 Profiles"]
 )
 
 # ────────────────────────────────────────────────────────────────────────
@@ -1468,15 +1753,62 @@ with tab_market:
     except Exception:
         st.error("Market regime unavailable.")
     else:
-        # Optional: custom CSS if you want the extra styling you defined
-        # _inject_regimen_css()
-        render_market_sentiment_dashboard(market_regime)
+        # ——— light styling for nicer-looking tabs ———
+        st.markdown(
+            """
+            <style>
+            .stTabs [data-baseweb="tab-list"] { gap: 8px; }
+            .stTabs [data-baseweb="tab"] {
+                padding: 10px 14px;
+                border-radius: 12px;
+                background: var(--secondary-background-color, rgba(255,255,255,0.04));
+            }
+            .stTabs [aria-selected="true"] {
+                background: rgba(56, 189, 248, 0.15);
+                border: 1px solid rgba(56, 189, 248, 0.35);
+            }
+            .stTabs [data-baseweb="tab"]:hover {
+                background: rgba(125,125,125,0.12);
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # Iconized tabs
+        tab_dash, tab_bt = st.tabs(["📊 Dashboard", "🧪 Backtest"])
+
+        with tab_dash:
+            with st.spinner("Building dashboard…"):
+                # Controller: uses market_regime as the fetch_fn
+                render_market_sentiment_page(market_regime)
+
+        with tab_bt:
+            with st.spinner("Running backtest…"):
+                render_market_regime_backtest(market_regime)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # 📊 REVIEW TAB
 # ────────────────────────────────────────────────────────────────────────────────
 with tab_review:
     st.subheader("Results")
+
+    if cols["ticker"]:
+        tickers = df_view[cols["ticker"]].astype(str).tolist()
+
+        def _sync_from_review():
+            st.session_state["sel_ticker"] = st.session_state["sel_ticker_review"]
+            # keep the other tab’s widget in sync next run
+            st.session_state["sel_ticker_backtest"] = st.session_state["sel_ticker"]
+
+        st.selectbox(
+            "Select ticker",
+            tickers,
+            index=tickers.index(st.session_state["sel_ticker"]) if tickers else 0,
+            key="sel_ticker_review",
+            on_change=_sync_from_review,
+        )
+
     # Row & series selection + table (table displayed here)
     row, chosen_cols, x, y_close, y_sma, y_open, y_high, y_low = pick_row_and_series(df_view, cols)
 
@@ -1782,20 +2114,40 @@ with tab_review:
     )
 
 # ────────────────────────────────────────────────────────────────────────────────
-# 🧠 SIGNALS TAB
+# 🧪 BACKTEST TAB
 # ────────────────────────────────────────────────────────────────────────────────
-with tab_signals:
-    st.subheader("Buy/Sell Engines")
+with tab_backtest:
+    st.subheader("Backtest & DCA simulator")
 
-    # Basic inputs that depend on the Review tab’s last_val/reward_R
-    # We recompute minimal context here to keep this tab self-contained.
-    row = df_view.iloc[0] if df_view.empty is False else df.iloc[0]
+    # ---- Shared ticker selection (syncs with Review) ----
+    if cols["ticker"]:
+        tickers = df_view[cols["ticker"]].astype(str).tolist()
+
+        def _sync_from_backtest():
+            st.session_state["sel_ticker"] = st.session_state["sel_ticker_backtest"]
+            # keep Review tab’s widget in sync next run
+            st.session_state["sel_ticker_review"] = st.session_state["sel_ticker"]
+
+        st.selectbox(
+            "Select ticker",
+            tickers,
+            index=tickers.index(st.session_state["sel_ticker"]) if tickers else 0,
+            key="sel_ticker_backtest",
+            on_change=_sync_from_backtest,
+        )
+
+    # use the shared selection to choose the row/series
+    sel = st.session_state.get("sel_ticker")
+    row = (df_view[df_view[cols["ticker"]].astype(str) == sel].iloc[0]
+           if (sel and not df_view.empty) else (df_view.iloc[0] if not df_view.empty else df.iloc[0]))
+
+
     x, y_close, y_sma, y_open, y_high, y_low = _get_series_lists(
         row, cols["dates_series"], cols["close_series"], cols["sma200_series"], cols["open_series"], cols["high_series"], cols["low_series"]
     )
 
+    # ---- Quick profile (same as before) ----
     profile = st.radio("Profile", ["Conservative", "Balanced", "Aggressive"], horizontal=True, index=1)
-
     preset = {
         "Conservative": dict(composite_threshold=0.70, w_rsi=0.20, w_trend=0.35, w_breakout=0.25, w_value=0.15, w_flow=0.05,
                              rsi_buy_max=40.0, vol_ratio_min=1.75, atr_mult=2.0, stop_pct=12.0, reward_R=2.0,
@@ -1818,96 +2170,114 @@ with tab_signals:
                            donch_lookback_sell=15, gap_down_min_pct=0.3),
     }[profile]
 
-with st.expander("Tune parameters", expanded=False):
-    tab_buy, tab_sell, tab_risk = st.tabs(["BUY thresholds & weights", "SELL thresholds & weights", "Risk & sizing"])
+    # ---- Tune parameters (same as previous Signals tab, but inside this tab) ----
+    with st.expander("Tune parameters", expanded=False):
+        tab_buy, tab_sell, tab_risk = st.tabs(["BUY thresholds & weights", "SELL thresholds & weights", "Risk & sizing"])
 
-    with tab_buy:
-        c1, c2 = st.columns(2)
-        with c1:
-            composite_threshold = st.slider("BUY: Composite threshold", 0.30, 0.90, float(preset["composite_threshold"]), 0.01, help=h("composite_threshold"))
-            rsi_buy_max        = st.slider("BUY: RSI buy max", 20, 70, int(preset["rsi_buy_max"]), 1, help=h("rsi_buy_max"))
-            vol_ratio_min      = st.slider("Min vol / avg20 (both)", 1.0, 3.0, float(preset["vol_ratio_min"]), 0.05, help=h("vol_ratio_min"))
-            value_center       = st.slider("BUY: Value center vs SMA200 (%)", -20.0, 10.0, -5.0, 0.5, help=h("value_center"))
-            donch_lookback     = st.slider("BUY: Donchian lookback", 10, 60, int(preset.get("donch_lookback", 20)), 1, help=h("donch_lookback"))
-            gap_min_pct        = st.slider("BUY: Gap-up min % (vs prev high)", 0.0, 3.0, float(preset.get("gap_min_pct", 0.5)), 0.1, help=h("gap_min_pct"))
-        with c2:
-            atr_mult           = st.slider("BUY: ATR stop ×", 0.8, 3.0, float(preset["atr_mult"]), 0.1, help=h("atr_mult"))
-            stop_pct_ui        = st.slider("BUY: Fallback % stop", 3.0, 20.0, float(preset["stop_pct"]), 0.5, help=h("stop_pct_ui"))
-            sma_window         = st.slider("Trend window (days, buy)", 100, 300, 200, 10, help=h("sma_window"))
-            use_engine_stop    = st.checkbox("Use engine stop/target on chart", value=False, help=h("use_engine_stop"))
-            bb_window          = st.slider("Bollinger window", 10, 60, int(preset.get("bb_window", 20)), 1, help=h("bb_window"))
-            bb_k               = st.slider("Bollinger k (σ)", 1.0, 3.0, float(preset.get("bb_k", 2.0)), 0.1, help=h("bb_k"))
-        st.markdown("**Weights**")
-        c3, c4 = st.columns(2)
-        with c3:
-            w_rsi   = st.slider("Weight (BUY): RSI", 0.0, 1.0, float(preset["w_rsi"]), 0.05, help=h("w_rsi"))
-            w_trend = st.slider("Weight (BUY): Trend", 0.0, 1.0, float(preset["w_trend"]), 0.05, help=h("w_trend"))
-            w_value = st.slider("Weight (BUY): Value", 0.0, 1.0, float(preset["w_value"]), 0.05, help=h("w_value"))
-        with c4:
-            w_flow  = st.slider("Weight (BUY): Flow", 0.0, 1.0, float(preset["w_flow"]), 0.05, help=h("w_flow"))
-            w_bbands = st.slider("Weight (BUY): Bollinger %B", 0.0, 1.0, float(preset.get("w_bbands", 0.20)), 0.05, help=h("w_bbands"))
-            w_donch  = st.slider("Weight (BUY): Donchian",     0.0, 1.0, float(preset.get("w_donchian", 0.25)), 0.05, help=h("w_donch"))
-            w_break  = st.slider("Weight (BUY): Legacy breakout", 0.0, 1.0, float(preset.get("w_breakout", 0.00)), 0.05, help=h("w_break"))
+        with tab_buy:
+            c1, c2 = st.columns(2)
+            with c1:
+                composite_threshold = st.slider("BUY: Composite threshold", 0.30, 0.90, float(preset["composite_threshold"]), 0.01, help=h("composite_threshold"), key="sig_composite_threshold")
+                rsi_buy_max        = st.slider("BUY: RSI buy max", 20, 70, int(preset["rsi_buy_max"]), 1, help=h("rsi_buy_max"), key="sig_rsi_buy_max")
+                vol_ratio_min      = st.slider("Min vol / avg20 (both)", 1.0, 3.0, float(preset["vol_ratio_min"]), 0.05, help=h("vol_ratio_min"), key="sig_vol_ratio_min")
+                value_center       = st.slider("BUY: Value center vs SMA200 (%)", -20.0, 10.0, -5.0, 0.5, help=h("value_center"), key="sig_value_center")
+                donch_lookback     = st.slider("BUY: Donchian lookback", 10, 60, int(preset.get("donch_lookback", 20)), 1, help=h("donch_lookback"), key="sig_donch_lookback")
+                gap_min_pct        = st.slider("BUY: Gap-up min % (vs prev high)", 0.0, 3.0, float(preset.get("gap_min_pct", 0.5)), 0.1, help=h("gap_min_pct"), key="sig_gap_min_pct")
+            with c2:
+                atr_mult           = st.slider("BUY: ATR stop ×", 0.8, 3.0, float(preset["atr_mult"]), 0.1, help=h("atr_mult"), key="sig_atr_mult")
+                stop_pct_ui        = st.slider("BUY: Fallback % stop", 3.0, 20.0, float(preset["stop_pct"]), 0.5, help=h("stop_pct_ui"), key="sig_stop_pct_ui")
+                sma_window         = st.slider("Trend window (days, buy)", 100, 300, 200, 10, help=h("sma_window"), key="sig_sma_window")
+                use_engine_stop    = st.checkbox("Use engine stop/target on chart", value=False, help=h("use_engine_stop"), key="sig_use_engine_stop")
+                bb_window          = st.slider("Bollinger window", 10, 60, int(preset.get("bb_window", 20)), 1, help=h("bb_window"), key="sig_bb_window")
+                bb_k               = st.slider("Bollinger k (σ)", 1.0, 3.0, float(preset.get("bb_k", 2.0)), 0.1, help=h("bb_k"), key="sig_bb_k")
+            st.markdown("**Weights**")
+            c3, c4 = st.columns(2)
+            with c3:
+                w_rsi   = st.slider("Weight (BUY): RSI", 0.0, 1.0, float(preset["w_rsi"]), 0.05, help=h("w_rsi"), key="sig_w_rsi")
+                w_trend = st.slider("Weight (BUY): Trend", 0.0, 1.0, float(preset["w_trend"]), 0.05, help=h("w_trend"), key="sig_w_trend")
+                w_value = st.slider("Weight (BUY): Value", 0.0, 1.0, float(preset["w_value"]), 0.05, help=h("w_value"), key="sig_w_value")
+            with c4:
+                w_flow   = st.slider("Weight (BUY): Flow", 0.0, 1.0, float(preset["w_flow"]), 0.05, help=h("w_flow"), key="sig_w_flow")
+                w_bbands = st.slider("Weight (BUY): Bollinger %B", 0.0, 1.0, float(preset.get("w_bbands", 0.20)), 0.05, help=h("w_bbands"), key="sig_w_bbands")
+                w_donch  = st.slider("Weight (BUY): Donchian",     0.0, 1.0, float(preset.get("w_donchian", 0.25)), 0.05, help=h("w_donch"), key="sig_w_donch")
+                w_break  = st.slider("Weight (BUY): Legacy breakout", 0.0, 1.0, float(preset.get("w_breakout", 0.00)), 0.05, help=h("w_break"), key="sig_w_break")
 
-    with tab_sell:
-        c1, c2 = st.columns(2)
-        with c1:
-            sell_threshold      = st.slider("SELL: Composite threshold", 0.30, 0.90, float(preset["sell_threshold"]), 0.01, help=h("sell_threshold"))
-            rsi_overbought_min  = st.slider("SELL: RSI overbought min", 55, 85, int(preset["rsi_overbought_min"]), 1, help=h("rsi_overbought_min"))
-            donch_lookback_sell = st.slider("SELL: Donchian lookback", 10, 60, int(preset["donch_lookback_sell"]), 1, help=h("donch_lookback_sell"))
-        with c2:
-            ema_fast_span   = st.slider("SELL: EMA fast span", 5, 55, int(preset["ema_fast_span"]), 1, help=h("ema_fast_span"))
-            sma_mid_window  = st.slider("SELL: SMA mid window", 20, 100, int(preset["sma_mid_window"]), 1, help=h("sma_mid_window"))
-            gap_down_min_pct = st.slider("SELL: Gap-down min % (vs prev low)", 0.0, 3.0, float(preset["gap_down_min_pct"]), 0.1, help=h("gap_down_min_pct"))
-        st.markdown("**Weights**")
-        c3, c4 = st.columns(2)
-        with c3:
-            w_rsi_sell   = st.slider("Weight (SELL): RSI", 0.0, 1.0, float(preset.get("w_rsi_sell", 0.30)), 0.05, help=h("w_rsi_sell"))
-            w_trend_down = st.slider("Weight (SELL): Trend down", 0.0, 1.0, float(preset.get("w_trend_down", 0.30)), 0.05, help=h("w_trend_down"))
-            w_breakdown  = st.slider("Weight (SELL): Breakdown", 0.0, 1.0, float(preset.get("w_breakdown", 0.25)), 0.05, help=h("w_breakdown"))
-        with c4:
-            w_exhaustion = st.slider("Weight (SELL): Exhaustion", 0.0, 1.0, float(preset.get("w_exhaustion", 0.10)), 0.05, help=h("w_exhaustion"))
-            w_flow_out   = st.slider("Weight (SELL): Flow out", 0.0, 1.0, float(preset.get("w_flow_out", 0.05)), 0.05, help=h("w_flow_out"))
-            w_bbands_sell = st.slider("Weight (SELL): Bollinger %B", 0.0, 1.0, float(preset.get("w_bbands_sell", 0.25)), 0.05, help=h("w_bbands_sell"))
-            w_donch_sell  = st.slider("Weight (SELL): Donchian",     0.0, 1.0, float(preset.get("w_donchian_sell", 0.25)), 0.05, help=h("w_donch_sell"))
+        with tab_sell:
+            c1, c2 = st.columns(2)
+            with c1:
+                sell_threshold      = st.slider("SELL: Composite threshold", 0.30, 0.90, float(preset["sell_threshold"]), 0.01, help=h("sell_threshold"), key="sig_sell_threshold")
+                rsi_overbought_min  = st.slider("SELL: RSI overbought min", 55, 85, int(preset["rsi_overbought_min"]), 1, help=h("rsi_overbought_min"), key="sig_rsi_overbought_min")
+                donch_lookback_sell = st.slider("SELL: Donchian lookback", 10, 60, int(preset["donch_lookback_sell"]), 1, help=h("donch_lookback_sell"), key="sig_donch_lookback_sell")
+            with c2:
+                ema_fast_span   = st.slider("SELL: EMA fast span", 5, 55, int(preset["ema_fast_span"]), 1, help=h("ema_fast_span"), key="sig_ema_fast_span")
+                sma_mid_window  = st.slider("SELL: SMA mid window", 20, 100, int(preset["sma_mid_window"]), 1, help=h("sma_mid_window"), key="sig_sma_mid_window")
+                gap_down_min_pct = st.slider("SELL: Gap-down min % (vs prev low)", 0.0, 3.0, float(preset["gap_down_min_pct"]), 0.1, help=h("gap_down_min_pct"), key="sig_gap_down_min_pct")
+            st.markdown("**Weights**")
+            c3, c4 = st.columns(2)
+            with c3:
+                w_rsi_sell   = st.slider("Weight (SELL): RSI", 0.0, 1.0, float(preset.get("w_rsi_sell", 0.30)), 0.05, help=h("w_rsi_sell"), key="sig_w_rsi_sell")
+                w_trend_down = st.slider("Weight (SELL): Trend down", 0.0, 1.0, float(preset.get("w_trend_down", 0.30)), 0.05, help=h("w_trend_down"), key="sig_w_trend_down")
+                w_breakdown  = st.slider("Weight (SELL): Breakdown", 0.0, 1.0, float(preset.get("w_breakdown", 0.25)), 0.05, help=h("w_breakdown"), key="sig_w_breakdown")
+            with c4:
+                w_exhaustion = st.slider("Weight (SELL): Exhaustion", 0.0, 1.0, float(preset.get("w_exhaustion", 0.10)), 0.05, help=h("w_exhaustion"), key="sig_w_exhaustion")
+                w_flow_out   = st.slider("Weight (SELL): Flow out", 0.0, 1.0, float(preset.get("w_flow_out", 0.05)), 0.05, help=h("w_flow_out"), key="sig_w_flow_out")
+                w_bbands_sell = st.slider("Weight (SELL): Bollinger %B", 0.0, 1.0, float(preset.get("w_bbands_sell", 0.25)), 0.05, help=h("w_bbands_sell"), key="sig_w_bbands_sell")
+                w_donch_sell  = st.slider("Weight (SELL): Donchian",     0.0, 1.0, float(preset.get("w_donchian_sell", 0.25)), 0.05, help=h("w_donch_sell"), key="sig_w_donch_sell")
 
-    with tab_risk:
-        c1, c2 = st.columns(2)
-        with c1:
-            portfolio_value = st.number_input("Portfolio ($)", min_value=1000.0, value=20000.0, step=1000.0)
-            risk_per_trade_pct = st.number_input("Risk per trade (%)", min_value=0.1, max_value=5.0, value=0.5, step=0.1)
-        with c2:
-            min_adv_dollars = st.number_input("Min ADV$ (liquidity)", min_value=0.0, value=250000.0, step=25000.0)
+        with tab_risk:
+            c1, c2 = st.columns(2)
+            with c1:
+                portfolio_value = st.number_input("Portfolio ($)", min_value=1000.0, value=20000.0, step=1000.0, key="sig_portfolio_value")
+                risk_per_trade_pct = st.number_input("Risk per trade (%)", min_value=0.1, max_value=5.0, value=0.5, step=0.1, key="sig_risk_per_trade_pct")
+            with c2:
+                min_adv_dollars = st.number_input("Min ADV$ (liquidity)", min_value=0.0, value=250000.0, step=25000.0, key="sig_min_adv_dollars")
 
-
+    # ---- Build params from current widget values ----
     params = BuyParams(
-        composite_threshold=float(composite_threshold),
-        w_rsi=float(w_rsi), w_trend=float(w_trend), w_breakout=float(w_break), w_value=float(w_value), w_flow=float(w_flow),
-        rsi_buy_max=float(rsi_buy_max), rsi_floor=20.0,
-        sma200_window=int(sma_window),
-        donch_lookback=int(donch_lookback), gap_min_pct=float(gap_min_pct),
-        value_center_dev_pct=float(value_center), vol_ratio_min=float(vol_ratio_min),
-        use_engine_stop=bool(use_engine_stop), atr_mult=float(atr_mult), stop_pct=float(stop_pct_ui),
+        composite_threshold=float(st.session_state.get("sig_composite_threshold", preset["composite_threshold"])),
+        w_rsi=float(st.session_state.get("sig_w_rsi", preset["w_rsi"])),
+        w_trend=float(st.session_state.get("sig_w_trend", preset["w_trend"])),
+        w_breakout=float(st.session_state.get("sig_w_break", preset.get("w_breakout", 0.0))),
+        w_value=float(st.session_state.get("sig_w_value", preset["w_value"])),
+        w_flow=float(st.session_state.get("sig_w_flow", preset["w_flow"])),
+        rsi_buy_max=float(st.session_state.get("sig_rsi_buy_max", preset["rsi_buy_max"])), rsi_floor=20.0,
+        sma200_window=int(st.session_state.get("sig_sma_window", 200)),
+        donch_lookback=int(st.session_state.get("sig_donch_lookback", preset.get("donch_lookback", 20))),
+        gap_min_pct=float(st.session_state.get("sig_gap_min_pct", preset.get("gap_min_pct", 0.5))),
+        value_center_dev_pct=float(st.session_state.get("sig_value_center", -5.0)),
+        vol_ratio_min=float(st.session_state.get("sig_vol_ratio_min", preset["vol_ratio_min"])),
+        use_engine_stop=bool(st.session_state.get("sig_use_engine_stop", False)),
+        atr_mult=float(st.session_state.get("sig_atr_mult", preset["atr_mult"])),
+        stop_pct=float(st.session_state.get("sig_stop_pct_ui", preset["stop_pct"])),
         reward_R=float(preset["reward_R"]),
-        portfolio_value=float(portfolio_value), risk_per_trade_pct=float(risk_per_trade_pct),
-        min_price=1.0, min_adv_dollars=float(min_adv_dollars),
-        w_bbands=float(w_bbands), w_donchian=float(w_donch),
-        bb_window=int(bb_window), bb_k=float(bb_k),
-        w_bbands_sell=float(w_bbands_sell), w_donchian_sell=float(w_donch_sell),
-        sell_threshold=float(sell_threshold),
-        w_rsi_sell=float(w_rsi_sell), w_trend_down=float(w_trend_down), w_breakdown=float(w_breakdown),
-        w_exhaustion=float(w_exhaustion), w_flow_out=float(w_flow_out),
-        rsi_overbought_min=float(rsi_overbought_min),
-        ema_fast_span=int(ema_fast_span), sma_mid_window=int(sma_mid_window),
-        donch_lookback_sell=int(donch_lookback_sell), gap_down_min_pct=float(gap_down_min_pct),
+        portfolio_value=float(st.session_state.get("sig_portfolio_value", 20000.0)),
+        risk_per_trade_pct=float(st.session_state.get("sig_risk_per_trade_pct", 0.5)),
+        min_price=1.0, min_adv_dollars=float(st.session_state.get("sig_min_adv_dollars", 250000.0)),
+        w_bbands=float(st.session_state.get("sig_w_bbands", preset.get("w_bbands", 0.20))),
+        w_donchian=float(st.session_state.get("sig_w_donch", preset.get("w_donchian", 0.25))),
+        bb_window=int(st.session_state.get("sig_bb_window", preset.get("bb_window", 20))),
+        bb_k=float(st.session_state.get("sig_bb_k", preset.get("bb_k", 2.0))),
+
+        w_bbands_sell=float(st.session_state.get("sig_w_bbands_sell", preset.get("w_bbands_sell", 0.25))),
+        w_donchian_sell=float(st.session_state.get("sig_w_donch_sell", preset.get("w_donchian_sell", 0.25))),
+        sell_threshold=float(st.session_state.get("sig_sell_threshold", preset["sell_threshold"])),
+        w_rsi_sell=float(st.session_state.get("sig_w_rsi_sell", preset.get("w_rsi_sell", 0.30))),
+        w_trend_down=float(st.session_state.get("sig_w_trend_down", preset.get("w_trend_down", 0.30))),
+        w_breakdown=float(st.session_state.get("sig_w_breakdown", preset.get("w_breakdown", 0.25))),
+        w_exhaustion=float(st.session_state.get("sig_w_exhaustion", preset.get("w_exhaustion", 0.10))),
+        w_flow_out=float(st.session_state.get("sig_w_flow_out", preset.get("w_flow_out", 0.05))),
+        rsi_overbought_min=float(st.session_state.get("sig_rsi_overbought_min", preset["rsi_overbought_min"])),
+        ema_fast_span=int(st.session_state.get("sig_ema_fast_span", preset["ema_fast_span"])),
+        sma_mid_window=int(st.session_state.get("sig_sma_mid_window", preset["sma_mid_window"])),
+        donch_lookback_sell=int(st.session_state.get("sig_donch_lookback_sell", preset["donch_lookback_sell"])),
+        gap_down_min_pct=float(st.session_state.get("sig_gap_down_min_pct", preset["gap_down_min_pct"])),
     )
 
-    # Compute engines for current (full) series
+    # ---- Compute engines (Signals summary) ----
     buy_res  = compute_buy_signal(row=row, dates=x, close=y_close, sma200=y_sma, open_=y_open, high=y_high, low=y_low, params=params)
     sell_res = compute_sell_signal(row=row, dates=x, close=y_close, sma200=y_sma, open_=y_open, high=y_high, low=y_low, params=params)
     action, action_margin = _decide_action(buy_res, sell_res, params.composite_threshold, params.sell_threshold)
 
-    # Metrics summary
     e1, e2, e3, e4, e5 = st.columns(5)
     e1.metric("Action", action + (" ✅" if action != "HOLD" else ""))
     e2.metric("Buy score", f"{buy_res['score']:.2f}")
@@ -1930,73 +2300,22 @@ with st.expander("Tune parameters", expanded=False):
         if sell_res["reasons"]:
             st.warning("Triggers: " + "; ".join(sell_res["reasons"]))
 
-    with st.expander("Parameter sweep (grid)", expanded=False):
-        c1, c2, c3 = st.columns(3)
-        rsi_maxs = c1.multiselect("RSI buy max", [40,45,50], default=[45])
-        donchs   = c2.multiselect("Donch lookback", [15,20,25], default=[20])
-        thr      = c3.multiselect("BUY threshold", [0.55,0.60,0.65], default=[0.60])
-
-        if st.button("Run grid"):
-            rows = []
-            grid = param_grid({"rsi_buy_max": rsi_maxs, "donch": donchs, "thr": thr})
-            prog = st.progress(0.0)
-            for j, g in enumerate(grid, start=1):
-                params2 = params.__class__(**{**params.__dict__,
-                                              "rsi_buy_max": g["rsi_buy_max"],
-                                              "donch_lookback": g["donch"],
-                                              "composite_threshold": g["thr"]})
-                bi, si = compute_signal_series_for_row(row, x, y_close, y_sma, y_open, y_high, y_low, params2)
-                eq, trades, ret = run_dca_backtest(x, y_close, bi, si)
-                met = compute_metrics(eq, x)
-                rows.append({**g, **met, "Return": ret})
-                prog.progress(j/len(grid))
-            res = pd.DataFrame(rows)
-            st.dataframe(res, use_container_width=True)
-
-st.session_state["last_used_params"] = params
-
-# ────────────────────────────────────────────────────────────────────────────────
-# 🧪 BACKTEST TAB
-# ────────────────────────────────────────────────────────────────────────────────
-with tab_backtest:
+    # ---- Backtest (now in same tab) ----
+    st.markdown("---")
     st.subheader("Backtest & DCA simulator")
 
-    # Use currently filtered first row for consistency
-    row = df_view.iloc[0] if df_view.empty is False else df.iloc[0]
-    x, y_close, y_sma, y_open, y_high, y_low = _get_series_lists(
-        row, cols["dates_series"], cols["close_series"], cols["sma200_series"], cols["open_series"], cols["high_series"], cols["low_series"]
-    )
-
-    # Simple, safe default params (balanced) if none from Signals tab
-    if "last_used_params" in st.session_state:
-        params = st.session_state["last_used_params"]
-    else:
-        params = BuyParams(
-            composite_threshold=0.60, w_rsi=0.20, w_trend=0.20, w_breakout=0.00, w_value=0.10, w_flow=0.05,
-            rsi_buy_max=45.0, rsi_floor=20.0, sma200_window=200,
-            donch_lookback=20, gap_min_pct=0.5, value_center_dev_pct=-5.0, vol_ratio_min=1.50,
-            use_engine_stop=False, atr_mult=1.5, stop_pct=10.0, reward_R=2.0,
-            portfolio_value=20000.0, risk_per_trade_pct=0.5, min_price=1.0, min_adv_dollars=250000.0,
-            w_bbands=0.20, w_donchian=0.25, bb_window=20, bb_k=2.0,
-            w_bbands_sell=0.25, w_donchian_sell=0.25,
-            sell_threshold=0.60, w_rsi_sell=0.30, w_trend_down=0.30, w_breakdown=0.25, w_exhaustion=0.10, w_flow_out=0.05,
-            rsi_overbought_min=70.0, ema_fast_span=21, sma_mid_window=50, donch_lookback_sell=20, gap_down_min_pct=0.5,
-        )
-
-    # Controls
     c1, c2, c3 = st.columns(3)
     with c1:
-        starting_cash = st.number_input("Starting cash ($)", min_value=100.0, value=10_000.0, step=100.0)
-        buy_pct_first = st.slider("Buy % on first BUY", 0.0, 100.0, 25.0, 5.0)
-        buy_pct_next  = st.slider("Buy % on next BUY",  0.0, 100.0, 25.0, 5.0)
+        starting_cash = st.number_input("Starting cash ($)", min_value=100.0, value=10_000.0, step=100.0, key="bt_start_cash")
+        buy_pct_first = st.slider("Buy % on first BUY", 0.0, 100.0, 25.0, 5.0, key="bt_buy_first")
+        buy_pct_next  = st.slider("Buy % on next BUY",  0.0, 100.0, 25.0, 5.0, key="bt_buy_next")
     with c2:
-        dca_trigger_drop_pct = st.slider("Extra BUY only if price ≤ last buy by (%)", 0.0, 50.0, 5.0, 1.0)
-        max_dca_legs = st.slider("Max DCA legs per accumulation", 0, 10, 3, 1)
+        dca_trigger_drop_pct = st.slider("Extra BUY only if price ≤ last buy by (%)", 0.0, 50.0, 5.0, 1.0, key="bt_dca_trigger")
+        max_dca_legs = st.slider("Max DCA legs per accumulation", 0, 10, 3, 1, key="bt_dca_legs")
     with c3:
-        sell_pct_first = st.slider("Sell % on first SELL", 0.0, 100.0, 50.0, 5.0)
-        sell_pct_next  = st.slider("Sell % on next SELL",  0.0, 100.0, 50.0, 5.0)
+        sell_pct_first = st.slider("Sell % on first SELL", 0.0, 100.0, 50.0, 5.0, key="bt_sell_first")
+        sell_pct_next  = st.slider("Sell % on next SELL",  0.0, 100.0, 50.0, 5.0, key="bt_sell_next")
 
-    # Historical signal series using current params
     buy_idx, sell_idx = compute_signal_series_for_row(
         row=row, x=x, close=y_close, sma200=y_sma, open_=y_open, high=y_high, low=y_low, params=params
     )
@@ -2009,26 +2328,23 @@ with tab_backtest:
         sell_pct_first=sell_pct_first, sell_pct_next=sell_pct_next,
     )
 
-    # Plot price + markers + equity
+    aset = get_settings()["chart"]
     fig_bt = go.Figure()
     fig_bt.add_trace(go.Scatter(x=x, y=y_close, mode="lines", name="Close"))
-    # Respect "Show SMA" from Review
     if bool(st.session_state.get("show_sma", get_settings()["chart"]["show_sma"])):
         fig_bt.add_trace(go.Scatter(x=x, y=y_sma, mode="lines", name="SMA200", line=dict(color=th["sma200"])))
 
-    # Reuse overlays (e.g., Bollinger) from Review
+    # Reuse overlays (from Review)
     chosen_overlays_bt = st.session_state.get("overlays", [])
     overlay_params_bt  = st.session_state.get("overlay_params_loaded", {})
-
     bt_shapes, bt_annotations = [], []
     for key in chosen_overlays_bt:
         entry = TECHNICALS_REGISTRY.get(key)
         if not entry:
             continue
-        params = overlay_params_bt.get(key, entry.get("params", {}))
-        res = entry["fn"](x, pd.Series(y_close), pd.Series(y_sma), row, params)
+        p = overlay_params_bt.get(key, entry.get("params", {}))
+        res = entry["fn"](x, pd.Series(y_close), pd.Series(y_sma), row, p)
         for tr in (res.traces or []):
-            # default a color if not set
             if not getattr(tr, "line", None) or not getattr(tr.line, "color", None):
                 tr.line = dict(color=th["overlay"])
             fig_bt.add_trace(tr)
@@ -2036,19 +2352,18 @@ with tab_backtest:
             bt_shapes.extend(res.shapes)
         if res.annotations:
             bt_annotations.extend(res.annotations)
-    
+
     if len(buy_idx):
         fig_bt.add_trace(go.Scatter(
             x=x[buy_idx], y=y_close[buy_idx], mode="markers",
             name="BUY (hist)", marker=dict(symbol="triangle-up", size=10, color=th["buy"])
-    ))
+        ))
     if len(sell_idx):
         fig_bt.add_trace(go.Scatter(
             x=x[sell_idx], y=y_close[sell_idx], mode="markers",
             name="SELL (hist)", marker=dict(symbol="triangle-down", size=10, color=th["sell"])
         ))
 
-    aset = get_settings()["chart"]
     fig_bt.update_layout(
         yaxis=dict(title="Price"),
         yaxis2=dict(title="Strategy equity", overlaying="y", side="right", showgrid=False),
@@ -2070,6 +2385,9 @@ with tab_backtest:
             st.dataframe(tdf[["date","side","price","qty","cash","shares"]], use_container_width=True, hide_index=True)
         else:
             st.caption("No trades executed by this configuration.")
+
+    # Make params available to other places
+    st.session_state["last_used_params"] = params
 
 # ────────────────────────────────────────────────────────────────────────────────
 # ⚙️ SETTINGS TAB

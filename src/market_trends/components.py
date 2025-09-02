@@ -14,46 +14,75 @@ CATEGORY_LABELS = {
 
 CATEGORY_HELP = {
     "equities": (
-        "Core U.S. equity trend and momentum signals, combining weekly tanh trends for SPY, QQQ, IWM, RSP, "
-        "and VTI plus SPY’s 4w/13w momentum. Higher values = stronger equity tape. Raising this weight makes "
-        "the overall headline more equity-driven."
+        "US Equities — trend + momentum.\n\n"
+        "Core pulse of the market (SPY/QQQ/IWM/RSP). When this weight is high, the composite "
+        "leans heavily on equity price action itself. Strong uptrends lift the headline more, "
+        "and selloffs drag it harder. Lower weight = equities have less sway; higher = the market "
+        "regime is defined by equity benchmarks."
     ),
+
     "breadth": (
-        "Participation breadth indicators such as the RSP/SPY ratio vs. 200dma and 1-year percentile. "
-        "Higher values = healthier, broader participation vs. narrow mega-cap leadership."
+        "Breadth — participation vs mega-caps.\n\n"
+        "Measures whether rallies are broad-based or dominated by a few giants. High breadth "
+        "weight rewards environments where many stocks participate (healthier, sustainable rallies). "
+        "Low breadth or weak internals drag the headline. Raising this weight emphasizes the quality "
+        "of participation over index-level gains."
     ),
+
     "vol": (
-        "Volatility regime using VIX levels/percentiles and term structure (VIX9D vs. VIX3M). "
-        "Lower volatility percentiles = calmer, risk-on conditions. Backwardation (short-term VIX > long-term) "
-        "counts as stress. Higher weight penalizes spikes in volatility."
+        "Volatility — VIX level & term structure.\n\n"
+        "Captures stress or calm in option markets. Low vol → risk-on, high vol → risk-off. "
+        "High weight = spikes in VIX punish the composite more, calm conditions boost it. "
+        "Lower weight = volatility plays a minor role in sentiment."
     ),
+
     "rates_credit": (
-        "Interest rates and credit proxies: credit risk-on (HYG/IEF above 200dma), breakevens (TIP/IEF), "
-        "and curve slope (SHY/TLT; falling = easing). Higher values = looser/easier financial conditions."
+        "Rates & Credit — curve, breakevens, credit spreads.\n\n"
+        "Represents funding/economic conditions. Steep curves, tight spreads, and benign breakevens "
+        "signal easier conditions (risk-on). Inversions, widening spreads, or stressed credit weigh "
+        "on the composite if this weight is high. Reducing the weight minimizes macro/rates impact."
     ),
+
     "fx": (
-        "Foreign Exchange (U.S. Dollar trend). Based on DXY/UUP and USD vs. G10 composite. "
-        "USD weakness is generally risk-on for global assets. More weight increases headline sensitivity to USD swings."
+        "Forex — USD vs G10 / DXY.\n\n"
+        "A strong dollar can pressure risk assets; a weak USD often supports them. "
+        "When this weight is high, swings in FX meaningfully shift the composite. "
+        "Lower weight = FX is less influential, focusing more on domestic equity/credit signals."
     ),
-    "international": (
-        "Developed and Emerging Market equity tone, using trends across regional ETFs (Europe, Asia, EM). "
-        "Higher values = stronger ex-U.S. equity performance."
+
+    "intl": (
+        "International Equities — ex-US trends.\n\n"
+        "Signals global risk appetite. Strong EM/DM ex-US rallies reinforce bullish tone if weighted. "
+        "Weakness abroad drags when weight is high. Setting low weight makes the headline US-centric; "
+        "raising it ties sentiment more to global flows."
     ),
+
     "commodities": (
-        "Energy, metals, and broad commodity baskets. Rising commodities often reflect reflationary/cyclical strength. "
-        "Includes TLT inversion as a supportive rates component. Higher values = stronger commodity trends."
+        "Commodities & Real Assets.\n\n"
+        "Reflects cyclical and reflationary forces (energy, metals). Rising commodities can imply "
+        "growth optimism—or inflation risk. With higher weight, commodity moves swing the composite "
+        "more (pro-growth or inflation-driven). With lower weight, commodities play a minor supporting role."
     ),
+
     "reits": (
-        "Real Estate Investment Trusts (U.S./Global/Regional) and REITs vs. ACWI relative strength. "
-        "Sensitive to real rates and liquidity conditions. Higher values = stronger REIT performance."
+        "REITs — real estate tilt.\n\n"
+        "Highly sensitive to interest rates and credit conditions. Strong REITs = supportive backdrop "
+        "for risk. Weak REITs = stress in rate-sensitive sectors. Raising this weight makes rate/risk "
+        "conditions more visible in the headline. Lower weight = less emphasis on real estate sensitivity."
     ),
+
     "crypto": (
-        "Crypto assets (BTC/ETH) weekly trend and 200dma plus a simple crypto ‘risk state’. "
-        "Serves as a speculative risk/liquidity proxy. Higher values = stronger speculative risk appetite."
+        "Crypto Proxy — BTC/ETH trend.\n\n"
+        "Acts as a speculative risk barometer. Strong crypto = high speculative risk-on tone; "
+        "weak crypto = risk-off. With high weight, crypto swings can move the composite strongly. "
+        "With lower weight, crypto is just a fringe signal."
     ),
+
     "internals": (
-        "Market internals and positioning stress measures: Put/Call ratios (CPC/CPCE), MOVE index percentiles, "
-        "and SKEW hints. Lower values = healthier/less stressed market tape."
+        "Market Internals — put/call, MOVE, SKEW, etc.\n\n"
+        "Captures hidden cross-asset signals (option skew, bond vol, hedging flows). "
+        "Raising this weight makes subtle cross-market stress/optimism show up in the headline. "
+        "Lower weight = composite is driven more by surface-level price action."
     ),
 }
 # Keep a stable order in the UI
